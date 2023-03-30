@@ -11,3 +11,7 @@ This could be used as a lower-level layer to build, for example, an efficient fu
 Fair warning, I may not finish this, or even get anywhere with it. It's just a random side project.
 
 [HVM]: https://github.com/HigherOrderCO/HVM
+
+## What's the Name?
+
+"Sucre" is French for "sugar". I was trying to come up with an acronym like Symmetric Interaction Combinator Runtime ( SICR ), but I didn't like SICR, since I couldn't figure out how to pronounce it. So I just went with Sucre, which was close, but doesn't have a good acronym and ends up just being a name. It looks like there's nothing major named Sucre on GitHub yet. 😃
