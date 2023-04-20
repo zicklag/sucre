@@ -18,12 +18,12 @@ enum Subcommands {
     /// Execute an interaction combinator graph.
     Run {
         /// The path to the sucre file to execute.
-        file: PathBuf
+        file: PathBuf,
     },
 }
 
 fn main() {
-    let args = Args::parse();
+    let _args = Args::parse();
 
-    let runtime = sucre::Runtime::new();
+    let _runtime = sucre::Runtime::new();
 }

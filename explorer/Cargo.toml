@@ -1,0 +1,10 @@
+[package]
+name = "sucre_explorer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = { version = "0.21.3", features = ["persistence"] }
+env_logger = "0.10.0"
+log = "0.4.17"
+sucre = { path = "../" }
