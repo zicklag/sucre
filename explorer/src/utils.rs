@@ -8,6 +8,7 @@ pub struct Widget<F: StatefulWidget<S>, S: Sync + Send + Default + Clone + 'stat
 }
 
 impl<F: FnOnce(&mut egui::Ui, &mut S), S: Sync + Send + Default + Clone + 'static> Widget<F, S> {
+    #[allow(unused)] // temporary
     pub fn new(f: F) -> Self {
         Self {
             f,

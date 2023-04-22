@@ -1,7 +1,5 @@
 use eframe::egui;
 
-use prelude::*;
-
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let native_options = eframe::NativeOptions::default();
@@ -13,7 +11,6 @@ fn main() {
     .unwrap();
 }
 
-mod heap;
 mod utils;
 mod prelude {
     pub use crate::utils::*;
@@ -51,8 +48,8 @@ impl eframe::App for ExplorerApp {
                 ui.selectable_value(&mut self.tab, ExplorerTab::Heap, "Heap");
             });
         });
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            ExplorerTab::Heap => Widget::new(heap::ui).ui(ui),
+        egui::CentralPanel::default().show(ctx, |_ui| match self.tab {
+            ExplorerTab::Heap => todo!(),
         });
     }
 }

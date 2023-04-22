@@ -24,6 +24,4 @@ enum Subcommands {
 
 fn main() {
     let _args = Args::parse();
-
-    let _runtime = sucre::Runtime::new();
 }

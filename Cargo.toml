@@ -6,6 +6,9 @@ edition = "2021"
 [workspace]
 members = [".", "cli", "explorer"]
 
+[profile.dev]
+opt-level = 3
+
 [features]
 default = ["num_cpus"]
 
