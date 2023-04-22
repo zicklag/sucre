@@ -54,6 +54,7 @@ This does not account for external function calls or data nodes, which, if this 
     - As each thread walks through it's chunks, it walks through the list of active pairs, looking for the chunks that have one of the first nodes in an active pair in the chunk.
     - If it finds an active node in the chunk, it writes it's node type to the active pair list.
   - **Phase 4:** Backward pass over nodes.
+    - **Note:** threads that finish with their chunks might be able to move on to phase 4 without waiting for the other threads still working on stage 3.
     - Once we get to the last chunk of nodes, we start going backward over the list of nodes.
     - This time we search for the chunks containing the second node in the active pairs list.
     - Once we find an active pair, we write it's node kind to the second node of the active pair.
