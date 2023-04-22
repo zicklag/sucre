@@ -18,6 +18,8 @@ Fair warning, I may not finish this, or even get anywhere with it. It's just a r
 
 The idea is to be very cache efficient and almost completely eliminate random memory accesses while reducing the graph.
 
+This does not account for external function calls or data nodes, which, if this works, should be worked into the design.
+
 - The graph is represented by:
   - A chunked list of nodes, with each chunk fitting into CPU cache.
     - The list of nodes is represented with two bits for each node.
