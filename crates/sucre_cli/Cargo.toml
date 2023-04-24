@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-sucre = { path = "../" }
+sucre = { path = "../../" }
 
 clap = { version = "4.2.1", features = ["derive"] }

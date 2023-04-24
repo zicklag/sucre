@@ -1,7 +1,3 @@
-//! A runtime for symmetric interaction combinators.
+//! Symmetric interaction combinator runtime.
 
-use memmap2::MmapMut;
-use roaring::RoaringBitmap;
-
-#[macro_use]
-pub(crate) mod utils;
+pub use sucre_core::*;

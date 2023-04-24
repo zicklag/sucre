@@ -7,4 +7,4 @@ edition = "2021"
 eframe = { version = "0.21.3", features = ["persistence"] }
 env_logger = "0.10.0"
 log = "0.4.17"
-sucre = { path = "../" }
+sucre = { path = "../../" }
