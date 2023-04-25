@@ -1,23 +1,24 @@
 //! Utilities used internally
 
-/// Impl `Deref` and `Deref` mut for a tuple struct with a single element.
-#[doc(hidden)]
-macro_rules! newtype {
-    ($t:ident, $target:ty) => {
-        impl std::ops::Deref for $t {
-            type Target = $target;
+// This wasn't used, but might be useful later.
+// /// Impl `Deref` and `Deref` mut for a tuple struct with a single element.
+// #[doc(hidden)]
+// macro_rules! newtype {
+//     ($t:ident, $target:ty) => {
+//         impl std::ops::Deref for $t {
+//             type Target = $target;
 
-            fn deref(&self) -> &Self::Target {
-                &self.0
-            }
-        }
-        impl std::ops::DerefMut for $t {
-            fn deref_mut(&mut self) -> &mut Self::Target {
-                &mut self.0
-            }
-        }
-    };
-}
+//             fn deref(&self) -> &Self::Target {
+//                 &self.0
+//             }
+//         }
+//         impl std::ops::DerefMut for $t {
+//             fn deref_mut(&mut self) -> &mut Self::Target {
+//                 &mut self.0
+//             }
+//         }
+//     };
+// }
 
 pub(crate) struct DebugTimer {
     start: std::time::Instant,

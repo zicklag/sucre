@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use super::*;
 
 /// Compressed adjacency matrix for storing node connections.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Edges {
     /// The bitmap that stores the adjacency matrix.
     bitset: RoaringTreemap,

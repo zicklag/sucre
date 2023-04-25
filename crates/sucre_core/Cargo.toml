@@ -14,3 +14,7 @@ crossbeam-channel = "0.5.8"
 crossbeam-utils = "0.8.15"
 cached = { version = "0.43.0", default-features = false, features = ["proc_macro"] }
 threadpool = "1.8.1"
+event-listener = "2.5.3"
+bitfield = "0.14.0"
+cache-size = "0.6.0"
+async-mutex = "1.4.0"
