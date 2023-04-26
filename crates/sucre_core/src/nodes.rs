@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_mutex::{Mutex, MutexGuardArc};
-use memmap2::MmapMut;
+use memmap2::{Advice, MmapMut};
 
 /// Stores the interaction combinator nodes.
 pub struct Nodes {
@@ -18,6 +18,7 @@ impl Clone for Nodes {
             .try_lock()
             .expect("Cannot clone `Chunks` while it is locked");
         let mut new_mmap = MmapMut::map_anon(mmap.len()).expect("Could not map memory");
+        new_mmap.advise(Advice::Sequential).ok();
         new_mmap.copy_from_slice(&mmap);
 
         Self {
@@ -44,10 +45,10 @@ impl Nodes {
         // Round the size up to an increment of L2 cache.
         let memory_size = memory_size + (threads - (memory_size % threads));
 
+        let mmap = MmapMut::map_anon(memory_size).expect("Could not map memory");
+        mmap.advise(Advice::Sequential).ok();
         Nodes {
-            mmap: Arc::new(Mutex::new(
-                MmapMut::map_anon(memory_size).expect("Could not map memory"),
-            )),
+            mmap: Arc::new(Mutex::new(mmap)),
             threads,
         }
     }

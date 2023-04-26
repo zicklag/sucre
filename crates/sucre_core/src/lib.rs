@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
 use bit_field::BitField;
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{unbounded as channel, Sender};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 #[macro_use]
@@ -181,17 +181,12 @@ impl Runtime {
                         }
                     });
 
-                struct PendingAllocation {
-                    kind: NodeKind,
-                    edge_mutation: EdgeMutation,
-                }
-
                 // Create channel for sending pending allocations
                 let (pending_allocation_sender, pending_allocation_receiver) =
-                    unbounded::<PendingAllocation>();
+                    channel::<PendingAllocation>();
 
                 // Create channel for sending edge mutations
-                let (edge_mutation_sender, edge_mutation_receiver) = unbounded::<EdgeMutation>();
+                let (edge_mutation_sender, edge_mutation_receiver) = channel::<EdgeMutation>();
 
                 // Iterate over the chunks of nodes in parallel, applying the second pass, to apply
                 // annihilations, duplications, and erases.
@@ -354,8 +349,108 @@ impl Runtime {
                                 }
                             }
                         }
+
+                        // Check for any pending allocations from other chunks
+                        let nodes = nodes.iter_mut();
+                        handle_pending_allocations(
+                            nodes,
+                            chunk_node_idx_start,
+                            pending_allocation_receiver.try_iter(),
+                            &pending_allocation_sender,
+                            &edge_mutation_sender,
+                        )
                     });
+
+                // Handle any remaining allocations that weren't finished during the chunk evaluation.
+                // Check for any pending allocations from other chunks
+                let nodes = mmap.iter_mut();
+                handle_pending_allocations(
+                    nodes,
+                    0,
+                    pending_allocation_receiver.try_iter(),
+                    &pending_allocation_sender,
+                    &edge_mutation_sender,
+                );
+
+                // If we still have pending allocations
+                if !pending_allocation_receiver.is_empty() {
+                    // All of our nodes are allocated and we don't have room. In the future we
+                    // should allocate another page of memory to store the nodes in.
+                    todo!("Expand node memory: ran out of room.");
+                }
+
+                // Apply all edge mutations
+                // TODO(perf): do this in parallel while the other threads are processing chunks if
+                // posible.
+                self.graph
+                    .edges
+                    .apply_mutations(edge_mutation_receiver.try_iter());
             });
+        }
+    }
+}
+
+/// Helper struct for allocations that need to be deferred.
+struct PendingAllocation {
+    kind: NodeKind,
+    edge_mutations: [Option<EdgeMutation>; 3],
+}
+
+/// Helper to attempt to allocate any pending allocations into the given iterator of nodes.
+fn handle_pending_allocations<'a, N, A>(
+    nodes: N,
+    node_start_idx: usize,
+    pending_allocations: A,
+    pending_allocation_sender: &Sender<PendingAllocation>,
+    edge_mutation_sender: &Sender<EdgeMutation>,
+) where
+    N: IntoIterator<Item = &'a mut u8>,
+    A: IntoIterator<Item = PendingAllocation>,
+{
+    let mut nodes = nodes.into_iter().enumerate();
+    'allocation: for pending_allocation in pending_allocations.into_iter() {
+        // Get the next byte in our chunk
+        let Some((node_byte_idx, node_byte)) = nodes.next() else {
+            // We're out of nodes, and can't fulfill the allocation, so send it
+            // back to the pending channel.
+            pending_allocation_sender.send(pending_allocation).unwrap();
+            break;
+        };
+
+        // For every node in the byte
+        for i in 0..NODES_PER_BYTE {
+            let bits_per_node = 8 / NODES_PER_BYTE;
+            let bits_start = i * bits_per_node;
+            let bits = bits_start..(bits_start + bits_per_node);
+
+            // If this node is empty
+            if node_byte.get_bits(bits.clone()) == NodeKind::Null as u8 {
+                // Make the allocation
+                node_byte.set_bits(bits, pending_allocation.kind as u8);
+
+                // Get the newly alllocated node's id
+                let node_id = (node_start_idx + node_byte_idx * NODES_PER_BYTE + i) as u64;
+
+                // For every edge mutation for this allocation
+                for mutation in pending_allocation.edge_mutations {
+                    let Some(mut mutation) = mutation else { continue; };
+
+                    // Replace the `a` node in the mutation with the allocated node's id
+                    match &mut mutation {
+                        EdgeMutation::Reconnect(edge)
+                        | EdgeMutation::Bridge(edge)
+                        | EdgeMutation::InsertEdge(edge)
+                        | EdgeMutation::RemoveEdge(edge) => {
+                            edge.a = node_id;
+                        }
+                    }
+
+                    // Queue the mutation
+                    edge_mutation_sender.send(mutation).unwrap();
+                }
+
+                break 'allocation;
+            }
         }
     }
 }
