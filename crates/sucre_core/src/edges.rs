@@ -157,7 +157,37 @@ impl Edges {
                         b_port: b2_port,
                     });
                 }
-                EdgeMutation::InsertEdge(edge) => {
+                EdgeMutation::InsertEdge(
+                    edge @ Edge {
+                        a,
+                        b,
+                        a_port,
+                        b_port,
+                    },
+                ) => {
+                    // Find out if `a` is already connected to another node
+                    if let Some((other, other_port)) = self.get(a, a_port) {
+                        // Remove the edge between them
+                        self.remove(Edge {
+                            a,
+                            b: other,
+                            a_port,
+                            b_port: other_port,
+                        });
+                    }
+
+                    // Find out if `b` is already connected to another node
+                    if let Some((other, other_port)) = self.get(b, b_port) {
+                        // Remove the edge between them
+                        self.remove(Edge {
+                            a: b,
+                            b: other,
+                            a_port: b_port,
+                            b_port: other_port,
+                        });
+                    }
+
+                    // Insert the new edge
                     self.insert(edge);
                 }
                 EdgeMutation::RemoveEdge(edge) => {
@@ -167,27 +197,23 @@ impl Edges {
         }
     }
 
+    #[track_caller]
+    fn id_for_node_port(mut node: NodeId, port: Uint) -> u64 {
+        assert!(port < 3, "Port is too high.");
+        assert_eq!(
+            node.get_bits(62..64),
+            0,
+            "Node ID too high to store in `Edges`"
+        );
+        node.set_bits(62..64, port);
+        node
+    }
+
     /// Helper to get the idx of an edge in the bitmap, given the nodes that it connects.
     #[track_caller]
     fn ids_for_edge(edge: Edge) -> (u64, u64) {
-        let mut node_a = edge.a;
-        let mut node_b = edge.b;
-        assert!(edge.a_port < 3, "Port `a` is too high.");
-        assert!(edge.b_port < 3, "Port `a` is too high.");
-        assert_eq!(
-            node_a.get_bits(62..64),
-            0,
-            "Node ID `a` too high to store in `Edges`"
-        );
-        assert_eq!(
-            node_a.get_bits(62..64),
-            0,
-            "Node ID `b` too high to store in `Edges`"
-        );
-
-        node_a.set_bits(62..64, edge.a_port);
-        node_b.set_bits(62..64, edge.b_port);
-
+        let node_a = Self::id_for_node_port(edge.a, edge.a_port);
+        let node_b = Self::id_for_node_port(edge.b, edge.b_port);
         (node_a, node_b)
     }
 

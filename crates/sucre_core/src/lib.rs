@@ -275,7 +275,86 @@ impl Runtime {
                                         // Duplication rule
                                         //
                                         (NodeKind::Constructor, NodeKind::Duplicator)
-                                        | (NodeKind::Duplicator, NodeKind::Constructor) => {}
+                                        | (NodeKind::Duplicator, NodeKind::Constructor) => {
+                                            // The lower node is repsonsible for modifying the edges appropriately
+                                            if node < other_node {
+                                                // Switch this node to the kind of the other node
+                                                nodes[node_byte_idx]
+                                                    .set_bits(bits, other_node_kind as u8);
+
+                                                // Connect this node's port 0 to whatever was connected to it's own port 1
+                                                edge_mutation_sender
+                                                    .send(EdgeMutation::Reconnect(Edge {
+                                                        a: node,
+                                                        b: node,
+                                                        a_port: 0,
+                                                        b_port: 1,
+                                                    }))
+                                                    .unwrap();
+
+                                                // Connect the other node's port 0 whatever was connected to our port 2
+                                                edge_mutation_sender
+                                                    .send(EdgeMutation::Reconnect(Edge {
+                                                        a: other_node,
+                                                        b: node,
+                                                        a_port: 0,
+                                                        b_port: 2,
+                                                    }))
+                                                    .unwrap();
+
+                                                // Allocate the other two nodes
+                                                pending_allocation_sender
+                                                    .send(PendingAllocation {
+                                                        kind: node_kind,
+                                                        edge_mutations: [
+                                                            Some(EdgeMutation::Reconnect(Edge {
+                                                                a: 0, // This will be filled in with the allocated node
+                                                                b: other_node,
+                                                                a_port: 0,
+                                                                b_port: 2,
+                                                            })),
+                                                            Some(EdgeMutation::InsertEdge(Edge {
+                                                                a: 0,
+                                                                b: node,
+                                                                a_port: 1,
+                                                                b_port: 2,
+                                                            })),
+                                                            Some(EdgeMutation::InsertEdge(Edge {
+                                                                a: 0,
+                                                                b: other_node,
+                                                                a_port: 2,
+                                                                b_port: 2,
+                                                            })),
+                                                        ],
+                                                    })
+                                                    .unwrap();
+                                                pending_allocation_sender
+                                                    .send(PendingAllocation {
+                                                        kind: node_kind,
+                                                        edge_mutations: [
+                                                            Some(EdgeMutation::Reconnect(Edge {
+                                                                a: 0,
+                                                                b: other_node,
+                                                                a_port: 0,
+                                                                b_port: 1,
+                                                            })),
+                                                            Some(EdgeMutation::InsertEdge(Edge {
+                                                                a: 0,
+                                                                b: other_node,
+                                                                a_port: 2,
+                                                                b_port: 1,
+                                                            })),
+                                                            Some(EdgeMutation::InsertEdge(Edge {
+                                                                a: 0,
+                                                                b: node,
+                                                                a_port: 1,
+                                                                b_port: 1,
+                                                            })),
+                                                        ],
+                                                    })
+                                                    .unwrap();
+                                            }
+                                        }
 
                                         //
                                         // Duplicators/constructors connected to erasers
