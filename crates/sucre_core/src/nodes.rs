@@ -3,13 +3,11 @@
 use std::sync::Arc;
 
 use async_mutex::{Mutex, MutexGuardArc};
-use cache_size::CacheType;
 use memmap2::MmapMut;
 
 /// Stores the interaction combinator nodes.
 pub struct Nodes {
     mmap: Arc<Mutex<MmapMut>>,
-    chunk_size: usize,
     threads: usize,
 }
 
@@ -24,7 +22,6 @@ impl Clone for Nodes {
 
         Self {
             mmap: Arc::new(Mutex::new(new_mmap)),
-            chunk_size: self.chunk_size,
             threads: self.threads,
         }
     }
@@ -33,8 +30,7 @@ impl Clone for Nodes {
 impl Nodes {
     /// Create a new node storage with the given `memory_size` and thread count.
     ///
-    /// The `memory_size` is in bytes and will be rounded up to increments of the detected L2 cache
-    /// size and the thread count ( i.e. the `memory_size` will be made evenly divisible by both ).
+    /// The `memory_size` is in bytes and will be rounded up to increments of the thread count.
     ///
     /// For now, the `memory_size` is a hard limit and if the graph grows beyond the `memory_size`
     /// during reduction it will panic.
@@ -45,110 +41,27 @@ impl Nodes {
     /// TODO(perf): We need to do more careful investigation into the potential architecture of the
     /// caches and how it may effect our iteration strategy.
     pub fn new(memory_size: usize, threads: usize) -> Self {
-        // TODO(perf): Find out a good deafult L2 cache size guess.
-        let chunk_size = cache_size::cache_size(2, CacheType::Data).unwrap_or(1024 * 1024 * 4);
-
         // Round the size up to an increment of L2 cache.
-        let size = memory_size + (chunk_size - (memory_size % chunk_size));
-        let size = size + (threads - (size % threads));
+        let memory_size = memory_size + (threads - (memory_size % threads));
 
         Nodes {
             mmap: Arc::new(Mutex::new(
-                MmapMut::map_anon(size).expect("Could not map memory"),
+                MmapMut::map_anon(memory_size).expect("Could not map memory"),
             )),
-            chunk_size,
             threads,
         }
     }
 
-    /// Get an unsafe iterator over the chunks, for the given number of threads.
-    pub fn chunk_iter(&self) -> ChunkIter {
-        ChunkIter {
-            mmap: self.mmap.clone(),
-            threads: self.threads,
-            l2_cache_size: self.chunk_size,
-            current_chunk: 0,
-        }
-    }
-}
-
-/// Iterator over the chunks of [`Nodes`].
-pub struct ChunkIter {
-    mmap: Arc<Mutex<MmapMut>>,
-    threads: usize,
-    l2_cache_size: usize,
-    current_chunk: usize,
-}
-
-impl Iterator for ChunkIter {
-    type Item = Chunk;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // Lock the memory map
-        let mmap = self
-            .mmap
+    /// Get a chunk of the memory, one for each thread, the given number of threads.
+    #[track_caller]
+    pub fn lock(&self) -> MutexGuardArc<MmapMut> {
+        self.mmap
             .try_lock_arc()
-            .expect("Cannot iterate while locked");
-
-        let chunk_count = mmap.len() / self.l2_cache_size;
-
-        //  We've gone through all our chunks
-        if self.current_chunk == chunk_count {
-            return None;
-        }
-
-        let start = self.current_chunk * self.l2_cache_size;
-        let end = start + self.l2_cache_size;
-
-        self.current_chunk += 1;
-
-        Some(Chunk {
-            mmap,
-            start,
-            end,
-            threads: self.threads,
-        })
+            .expect("Cannot lock `Nodes`: already locked.")
     }
 }
-
-/// A chunk of [`Nodes`].
-///
-/// Nodes are processed in chunks, dividing the nodes in the chunk between worker threads and
-/// completing the chunk before moving on to the next chunk.
-pub struct Chunk {
-    mmap: MutexGuardArc<MmapMut>,
-    start: usize,
-    end: usize,
-    threads: usize,
-}
-
-impl Chunk {
-    /// Iterate over the slices for each thread to process.
-    pub fn slice_for_threads(&mut self) -> std::slice::Chunks<u8> {
-        let slice_size = self.end - self.start;
-        self.mmap[self.start..self.end].chunks(slice_size / self.threads)
-    }
-}
-
-bitfield::bitfield! {
-    /// A set of 4 nodes packed into a byte.
-    #[derive(Copy, Clone, Hash, PartialEq, PartialOrd, Ord, Eq)]
-    #[repr(transparent)]
-    pub struct NodeByte(u8);
-    impl Debug;
-    /// Get the first node.
-    #[inline(always)]
-    pub from into NodeKind, a, set_a: 0, 1;
-    /// Get the second node.
-    #[inline(always)]
-    pub from into NodeKind, b, set_b: 2, 3;
-    /// Get the third node.
-    #[inline(always)]
-    pub from into NodeKind, c, set_c: 4, 5;
-    /// Get the fourth node.
-    #[inline(always)]
-    pub from into NodeKind, d, set_d: 6, 7;
-}
+/// The number of nodes stored in one byte.
+pub const NODES_PER_BYTE: usize = 4;
 
 /// The kind of node that a node in the graph is.
 #[repr(u8)]

@@ -7,8 +7,12 @@ use super::*;
 /// Compressed adjacency matrix for storing node connections.
 #[derive(Clone, Default)]
 pub struct Edges {
-    /// The bitmap that stores the adjacency matrix.
-    bitset: RoaringTreemap,
+    /// Hash map that stores edges by mapping a node and port to the node and port that it's
+    /// connected to.
+    ///
+    /// The first 62 bits of the u64 are used to store the node ID, and the last two bits store the
+    /// port number.
+    map: HashMap<u64, u64>,
     /// Cache of edges that have been moved during a call to [`Edges::apply_mutations`].
     dissolved_edges: HashMap<Edge, Edge>,
 }
@@ -20,9 +24,20 @@ impl Edges {
     }
 
     /// Get whether or not the given nodes are connected to each-other
-    pub fn get(&self, edge: Edge) -> bool {
-        let idx = Self::idx_for_edge(edge);
-        self.bitset.contains(idx)
+    #[track_caller]
+    pub fn get(&self, mut node: u64, port: Uint) -> Option<(u64, Uint)> {
+        assert_eq!(
+            node.get_bits(62..64),
+            0,
+            "Node ID too high to store in `Edges`"
+        );
+        node.set_bits(63..64, port);
+        self.map.get(&node).map(|node| {
+            let mut node = *node;
+            let port = node.get_bits(62..64);
+            node.set_bits(62..64, 0);
+            (node, port)
+        })
     }
 
     /// Insert an edge between the two given nodes.
@@ -30,26 +45,27 @@ impl Edges {
     /// Returns `true` if the edge did not previously exist.
     #[track_caller]
     pub fn insert(&mut self, edge: Edge) -> bool {
-        let idx = Self::idx_for_edge(edge);
-        self.bitset.insert(idx)
+        let (a, b) = Self::ids_for_edge(edge);
+        self.map.insert(a, b).is_none() && self.map.insert(b, a).is_none()
     }
 
     /// Remove an edge between two nodes.
     ///
     /// Returns `true` if the edge previously existed.
     pub fn remove(&mut self, edge: Edge) -> bool {
-        let idx = Self::idx_for_edge(edge);
-        self.bitset.remove(idx)
+        let (a, b) = Self::ids_for_edge(edge);
+        self.map.remove(&a).is_some() && self.map.remove(&b).is_some()
     }
 
-    /// Count the edges in
-    pub fn count(&self) -> Uint {
-        self.bitset.len()
+    /// Count the edges.
+    pub fn count(&self) -> usize {
+        // Divide length by two because we have two entries for each edge.
+        self.map.len() / 2
     }
 
     /// Iterate over all of the pairs of nodes in the graph.
     pub fn iter(&self) -> EdgeIter {
-        EdgeIter::new(self.bitset.iter())
+        EdgeIter::new(self.map.iter())
     }
 
     /// Iterate over all of the **active** pairs in the graph.
@@ -69,61 +85,97 @@ impl Edges {
 
         for mutation in mutations {
             match mutation {
-                EdgeMutation::Dissolve { mut a, b, mut c } => {
-                    // If the either of the outside edges have been dissovled, operate on the new
-                    // edges that replaced the dissolved one.
-                    while let Some(replaced_edge) = self.dissolved_edges.get(&a) {
-                        a = *replaced_edge;
-                    }
-                    while let Some(replaced_edge) = self.dissolved_edges.get(&c) {
-                        c = *replaced_edge;
-                    }
+                EdgeMutation::Bridge {
+                    a,
+                    a_port,
+                    b,
+                    b_port,
+                } => {
+                    // Find out what node b is connected to.
+                    let (b2, b2_port) = self.get(b, b_port).expect("missing edge");
 
-                    // Find the outside edge of a and the inside edge of c
-                    let (a_outside, a_outside_port, c_inside) = if a.a == b.a {
-                        (a.b, a.b_port, b.b)
-                    } else if a.b == b.a {
-                        (a.a, a.a_port, b.b)
-                    } else if a.a == b.b {
-                        (a.b, a.b_port, b.a)
-                    } else if a.b == b.b {
-                        (a.a, a.a_port, b.a)
-                    } else {
-                        unreachable!("Invalid dissolve");
-                    };
+                    // Remove the connection between `b` and `b2`
+                    self.remove(Edge {
+                        a: b2,
+                        b,
+                        a_port: b2_port,
+                        b_port,
+                    });
 
-                    // Find the outside edge of c
-                    let (c_outside, c_outside_port) = if c_inside == c.a {
-                        (c.b, c.b_port)
-                    } else if c_inside == c.b {
-                        (c.a, c.a_port)
-                    } else {
-                        unreachable!("Invalid dissolve");
-                    };
+                    // Find out what node a is connected to.
+                    let (a2, a2_port) = self.get(a, a_port).expect("missing edge");
 
-                    // Remove the individual edges
-                    self.remove(a);
-                    self.remove(b);
-                    self.remove(c);
+                    // Remove the connection between `a` and `a2`
+                    self.remove(Edge {
+                        a,
+                        b: a2,
+                        a_port,
+                        b_port: a2_port,
+                    });
 
-                    // Create a new edge connecting the ends of a and c
-                    let new_edge = Edge {
-                        a: a_outside,
-                        b: c_outside,
-                        a_port: a_outside_port,
-                        b_port: c_outside_port,
-                    }
-                    .canonical();
-                    self.insert(new_edge);
-
-                    // Record the edges a and c as having been dissolved
-                    self.dissolved_edges.insert(a, new_edge);
-                    self.dissolved_edges.insert(c, new_edge);
+                    // Connect `a` to `b2`
+                    self.insert(Edge {
+                        a,
+                        b: b2,
+                        a_port,
+                        b_port: b2_port,
+                    });
                 }
-                EdgeMutation::Insert(edge) => {
+                // EdgeMutation::Dissolve { mut a, b, mut c } => {
+                //     // If the either of the outside edges have been dissovled, operate on the new
+                //     // edges that replaced the dissolved one.
+                //     while let Some(replaced_edge) = self.dissolved_edges.get(&a) {
+                //         a = *replaced_edge;
+                //     }
+                //     while let Some(replaced_edge) = self.dissolved_edges.get(&c) {
+                //         c = *replaced_edge;
+                //     }
+
+                //     // Find the outside edge of a and the inside edge of c
+                //     let (a_outside, a_outside_port, c_inside) = if a.a == b.a {
+                //         (a.b, a.b_port, b.b)
+                //     } else if a.b == b.a {
+                //         (a.a, a.a_port, b.b)
+                //     } else if a.a == b.b {
+                //         (a.b, a.b_port, b.a)
+                //     } else if a.b == b.b {
+                //         (a.a, a.a_port, b.a)
+                //     } else {
+                //         unreachable!("Invalid dissolve");
+                //     };
+
+                //     // Find the outside edge of c
+                //     let (c_outside, c_outside_port) = if c_inside == c.a {
+                //         (c.b, c.b_port)
+                //     } else if c_inside == c.b {
+                //         (c.a, c.a_port)
+                //     } else {
+                //         unreachable!("Invalid dissolve");
+                //     };
+
+                //     // Remove the individual edges
+                //     self.remove(a);
+                //     self.remove(b);
+                //     self.remove(c);
+
+                //     // Create a new edge connecting the ends of a and c
+                //     let new_edge = Edge {
+                //         a: a_outside,
+                //         b: c_outside,
+                //         a_port: a_outside_port,
+                //         b_port: c_outside_port,
+                //     }
+                //     .canonical();
+                //     self.insert(new_edge);
+
+                //     // Record the edges a and c as having been dissolved
+                //     self.dissolved_edges.insert(a, new_edge);
+                //     self.dissolved_edges.insert(c, new_edge);
+                // }
+                EdgeMutation::InsertEdge(edge) => {
                     self.insert(edge);
                 }
-                EdgeMutation::Remove(edge) => {
+                EdgeMutation::RemoveEdge(edge) => {
                     self.remove(edge);
                 }
             }
@@ -132,40 +184,53 @@ impl Edges {
 
     /// Helper to get the idx of an edge in the bitmap, given the nodes that it connects.
     #[track_caller]
-    fn idx_for_edge(edge: Edge) -> Uint {
-        debug_assert!(
-            edge.a_port < 3,
-            "Node a's port id must be between 0 and 2 inclusive."
+    fn ids_for_edge(edge: Edge) -> (u64, u64) {
+        let mut node_a = edge.a;
+        let mut node_b = edge.b;
+        assert!(edge.a_port < 3, "Port `a` is too high.");
+        assert!(edge.b_port < 3, "Port `a` is too high.");
+        assert_eq!(
+            node_a.get_bits(62..64),
+            0,
+            "Node ID `a` too high to store in `Edges`"
         );
-        debug_assert!(
-            edge.b_port < 3,
-            "Node b's port id must be between 0 and 2 inclusive."
+        assert_eq!(
+            node_a.get_bits(62..64),
+            0,
+            "Node ID `b` too high to store in `Edges`"
         );
-        let a = edge.a * 3 + edge.a_port;
-        let b = edge.b * 3 + edge.b_port;
-        let x = a.min(b);
-        let y = a.max(b);
-        recursive_sum(y) + x
+
+        node_a.set_bits(62..64, edge.a_port);
+        node_b.set_bits(62..64, edge.b_port);
+
+        (node_a, node_b)
+    }
+
+    fn node_port_from_id(mut id: u64) -> (NodeId, Uint) {
+        let port = id.get_bits(62..64);
+        id.set_bits(62..64, 0);
+        (id, port)
     }
 }
 
 /// A mutation that may be made to an edge in [`Edges`].
 #[derive(Debug, Clone, Copy)]
 pub enum EdgeMutation {
-    /// Dissolve the three given edges, into one edge connecting the outside of `a` with the outside
-    /// of `c`, and deleting the center edge `b`.
-    Dissolve {
-        /// The first edge to connect.
-        a: Edge,
-        /// The second edge to connect.
-        b: Edge,
-        /// The third edge to connect.
-        c: Edge,
+    /// Connect node `a`'s `a_port` to whatever node `b`s `b_port` was connected to.
+    Bridge {
+        /// The first node.
+        a: NodeId,
+        /// The first node's port.
+        a_port: Uint,
+        /// The second node.
+        b: NodeId,
+        /// The second node's port.
+        b_port: Uint,
     },
     /// Insert a new edge.
-    Insert(Edge),
+    InsertEdge(Edge),
     /// Remove an existing edge.
-    Remove(Edge),
+    RemoveEdge(Edge),
 }
 
 // TODO(perf): We know that the `a_port` and `b_port` are going to be between 1 and 3, so should we
@@ -214,20 +279,12 @@ impl From<(NodeId, Uint, NodeId, Uint)> for Edge {
 
 /// Iterator over the pairs of connected nodes in an [`Edges`] store.
 pub struct EdgeIter<'a> {
-    iter: roaring::treemap::Iter<'a>,
-    y: Uint,
-    y_sum: Uint,
-    next_y_sum: Uint,
+    iter: std::collections::hash_map::Iter<'a, u64, u64>,
 }
 
 impl<'a> EdgeIter<'a> {
-    fn new(iter: roaring::treemap::Iter<'a>) -> Self {
-        Self {
-            iter,
-            y: 0,
-            y_sum: 0,
-            next_y_sum: 1,
-        }
+    fn new(iter: std::collections::hash_map::Iter<'a, u64, u64>) -> Self {
+        Self { iter }
     }
 }
 
@@ -235,26 +292,25 @@ impl<'a> Iterator for EdgeIter<'a> {
     type Item = Edge;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let edge_idx = self.iter.next()?;
+        loop {
+            let (a, b) = self.iter.next()?;
+            let (a, a_port) = Edges::node_port_from_id(*a);
+            let (b, b_port) = Edges::node_port_from_id(*b);
 
-        // TODO(perf): find a faster way to do this maybe?
-        while self.next_y_sum <= edge_idx {
-            self.y_sum = self.next_y_sum;
-            self.y += 1;
-            self.next_y_sum = self.y_sum + self.y + 1;
-        }
-        let x = edge_idx - self.y_sum;
-
-        Some(
-            Edge {
-                a: x / 3,
-                b: self.y / 3,
-                a_port: x % 3,
-                b_port: self.y % 3,
+            // Since the map contains two entries for each edge, we make sure we return each edge
+            // once by only returning edges where `a` is less than `b` or where `a_port` is less
+            // than `b_port` when the node is connected to itself.
+            if a > b || (a == b && a_port > b_port) {
+                continue;
             }
-            // Make sure the pair has the lowest-index node in `a`.
-            .canonical(),
-        )
+
+            return Some(Edge {
+                a,
+                b,
+                a_port,
+                b_port,
+            });
+        }
     }
 }
 
@@ -270,19 +326,6 @@ impl<'a> Iterator for ActivePairIter<'a> {
             .filter(|pair| pair.a_port == 0 && pair.b_port == 0)
             .map(|pair| (pair.a, pair.b))
             .next()
-    }
-}
-
-/// This helper returns the equivalent of a factorial for addition.
-// TODO(docs): There's a name for this, but I can't remember what it is. Update the name to use the
-// mathematical name for the construct.
-// TODO(perf): Benchmark with and without the memoization.
-#[cached::proc_macro::cached]
-fn recursive_sum(n: Uint) -> Uint {
-    if n == 0 {
-        0
-    } else {
-        n + recursive_sum(n - 1)
     }
 }
 
@@ -350,74 +393,74 @@ mod test {
         assert_eq!(active_pairs, vec![(d, b)]);
     }
 
-    /// Test that we can apply multiple annihilations on a couple nodes that are connected to
-    /// each-other and produce the correct result.
-    #[test]
-    fn test_apply_multiple_dissolve_mutations() {
-        let mut edges = Edges::new();
+    // /// Test that we can apply multiple annihilations on a couple nodes that are connected to
+    // /// each-other and produce the correct result.
+    // #[test]
+    // fn test_apply_multiple_dissolve_mutations() {
+    //     let mut edges = Edges::new();
 
-        // Create some nodes
-        //                                                                      a   b  c  d  e    f   g     h
-        let (a, b, c, d, e, f, g, h) = (10, 5, 8, 7, 104, 80, 1035, 195);
+    //     // Create some nodes
+    //     //                                                                      a   b  c  d  e    f   g     h
+    //     let (a, b, c, d, e, f, g, h) = (10, 5, 8, 7, 104, 80, 1035, 195);
 
-        // Connect them together to form a structure that will have two annihilations manipulating
-        // the same nodes.
-        let e = [
-            (a, 0, c, 1),
-            (b, 0, c, 2),
-            (c, 0, d, 0),
-            (d, 2, e, 1),
-            (d, 1, e, 2),
-            (e, 0, f, 0),
-            (f, 2, g, 0),
-            (f, 1, h, 0),
-        ]
-        .into_iter()
-        .map(Edge::from)
-        .collect::<Vec<_>>();
+    //     // Connect them together to form a structure that will have two annihilations manipulating
+    //     // the same nodes.
+    //     let e = [
+    //         (a, 0, c, 1),
+    //         (b, 0, c, 2),
+    //         (c, 0, d, 0),
+    //         (d, 2, e, 1),
+    //         (d, 1, e, 2),
+    //         (e, 0, f, 0),
+    //         (f, 2, g, 0),
+    //         (f, 1, h, 0),
+    //     ]
+    //     .into_iter()
+    //     .map(Edge::from)
+    //     .collect::<Vec<_>>();
 
-        for edge in &e {
-            edges.insert(*edge);
-        }
+    //     for edge in &e {
+    //         edges.insert(*edge);
+    //     }
 
-        // Manually create the edge dissolves that would be computed during graph reduction
-        let mutations = [
-            EdgeMutation::Dissolve {
-                a: e[0],
-                b: e[2],
-                c: e[4],
-            },
-            EdgeMutation::Dissolve {
-                a: e[1],
-                b: e[2],
-                c: e[3],
-            },
-            EdgeMutation::Dissolve {
-                a: e[3],
-                b: e[5],
-                c: e[7],
-            },
-            EdgeMutation::Dissolve {
-                a: e[4],
-                b: e[5],
-                c: e[6],
-            },
-        ];
+    //     // Manually create the edge dissolves that would be computed during graph reduction
+    //     let mutations = [
+    //         EdgeMutation::Dissolve {
+    //             a: e[0],
+    //             b: e[2],
+    //             c: e[4],
+    //         },
+    //         EdgeMutation::Dissolve {
+    //             a: e[1],
+    //             b: e[2],
+    //             c: e[3],
+    //         },
+    //         EdgeMutation::Dissolve {
+    //             a: e[3],
+    //             b: e[5],
+    //             c: e[7],
+    //         },
+    //         EdgeMutation::Dissolve {
+    //             a: e[4],
+    //             b: e[5],
+    //             c: e[6],
+    //         },
+    //     ];
 
-        // Apply the mutations
-        edges.apply_mutations(mutations);
+    //     // Apply the mutations
+    //     edges.apply_mutations(mutations);
 
-        // Check that we now have only two edges
-        assert_eq!(edges.count(), 2);
+    //     // Check that we now have only two edges
+    //     assert_eq!(edges.count(), 2);
 
-        // Make sure we have both of the edges that we expect
-        let expected = [Edge::from((a, 0, g, 0)), Edge::from((b, 0, h, 0))];
+    //     // Make sure we have both of the edges that we expect
+    //     let expected = [Edge::from((a, 0, g, 0)), Edge::from((b, 0, h, 0))];
 
-        for edge in edges.iter() {
-            assert!(
-                expected.iter().any(|x| x == &edge),
-                "Couldn't find expected edge"
-            )
-        }
-    }
+    //     for edge in edges.iter() {
+    //         assert!(
+    //             expected.iter().any(|x| x == &edge),
+    //             "Couldn't find expected edge"
+    //         )
+    //     }
+    // }
 }
