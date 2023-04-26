@@ -238,7 +238,43 @@ impl Runtime {
                                         // Annihilation rule
                                         //
                                         (NodeKind::Duplicator, NodeKind::Duplicator)
-                                        | (NodeKind::Constructor, NodeKind::Constructor) => {}
+                                        | (NodeKind::Constructor, NodeKind::Constructor) => {
+                                            // Delete this node
+                                            nodes[node_byte_idx].set_bits(bits, 0);
+
+                                            // The lower node is responsible for modifying the edges
+                                            if node < other_node {
+                                                // Disconnect the active pair
+                                                edge_mutation_sender
+                                                    .send(EdgeMutation::RemoveEdge(Edge {
+                                                        a: node,
+                                                        a_port: 0,
+                                                        b: other_node,
+                                                        b_port: 0,
+                                                    }))
+                                                    .unwrap();
+
+                                                // Bridge port 1 of this node to port 1 of the other node.
+                                                edge_mutation_sender
+                                                    .send(EdgeMutation::Bridge(Edge {
+                                                        a: node,
+                                                        b: other_node,
+                                                        a_port: 1,
+                                                        b_port: 1,
+                                                    }))
+                                                    .unwrap();
+
+                                                // Bridge port 2 of this node to port 2 of the other node.
+                                                edge_mutation_sender
+                                                    .send(EdgeMutation::Bridge(Edge {
+                                                        a: node,
+                                                        b: other_node,
+                                                        a_port: 2,
+                                                        b_port: 2,
+                                                    }))
+                                                    .unwrap();
+                                            }
+                                        }
 
                                         //
                                         // Duplication rule
@@ -264,12 +300,12 @@ impl Runtime {
                                             // Connect whatever node was connected to our port 2, to
                                             // our new port 0.
                                             edge_mutation_sender
-                                                .send(EdgeMutation::Bridge {
+                                                .send(EdgeMutation::Reconnect(Edge {
                                                     a: node,
                                                     a_port: 0,
                                                     b: node,
                                                     b_port: 2,
-                                                })
+                                                }))
                                                 .unwrap();
                                         }
                                         (
@@ -279,12 +315,12 @@ impl Runtime {
                                             // This node will stay an eraser, and we'll connect it
                                             // the node connected to the duplicator/constructor's port 1.
                                             edge_mutation_sender
-                                                .send(EdgeMutation::Bridge {
+                                                .send(EdgeMutation::Reconnect(Edge {
                                                     a: node,
                                                     a_port: 0,
                                                     b: other_node,
                                                     b_port: 1,
-                                                })
+                                                }))
                                                 .unwrap();
                                         }
 

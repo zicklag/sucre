@@ -85,12 +85,12 @@ impl Edges {
 
         for mutation in mutations {
             match mutation {
-                EdgeMutation::Bridge {
+                EdgeMutation::Reconnect(Edge {
                     a,
                     a_port,
                     b,
                     b_port,
-                } => {
+                }) => {
                     // Find out what node b is connected to.
                     let (b2, b2_port) = self.get(b, b_port).expect("missing edge");
 
@@ -121,57 +121,42 @@ impl Edges {
                         b_port: b2_port,
                     });
                 }
-                // EdgeMutation::Dissolve { mut a, b, mut c } => {
-                //     // If the either of the outside edges have been dissovled, operate on the new
-                //     // edges that replaced the dissolved one.
-                //     while let Some(replaced_edge) = self.dissolved_edges.get(&a) {
-                //         a = *replaced_edge;
-                //     }
-                //     while let Some(replaced_edge) = self.dissolved_edges.get(&c) {
-                //         c = *replaced_edge;
-                //     }
+                EdgeMutation::Bridge(Edge {
+                    a,
+                    a_port,
+                    b,
+                    b_port,
+                }) => {
+                    // Find out what node b is connected to.
+                    let (b2, b2_port) = self.get(b, b_port).expect("missing edge");
 
-                //     // Find the outside edge of a and the inside edge of c
-                //     let (a_outside, a_outside_port, c_inside) = if a.a == b.a {
-                //         (a.b, a.b_port, b.b)
-                //     } else if a.b == b.a {
-                //         (a.a, a.a_port, b.b)
-                //     } else if a.a == b.b {
-                //         (a.b, a.b_port, b.a)
-                //     } else if a.b == b.b {
-                //         (a.a, a.a_port, b.a)
-                //     } else {
-                //         unreachable!("Invalid dissolve");
-                //     };
+                    // Remove the connection between `b` and `b2`
+                    self.remove(Edge {
+                        a: b2,
+                        b,
+                        a_port: b2_port,
+                        b_port,
+                    });
 
-                //     // Find the outside edge of c
-                //     let (c_outside, c_outside_port) = if c_inside == c.a {
-                //         (c.b, c.b_port)
-                //     } else if c_inside == c.b {
-                //         (c.a, c.a_port)
-                //     } else {
-                //         unreachable!("Invalid dissolve");
-                //     };
+                    // Find out what node a is connected to.
+                    let (a2, a2_port) = self.get(a, a_port).expect("missing edge");
 
-                //     // Remove the individual edges
-                //     self.remove(a);
-                //     self.remove(b);
-                //     self.remove(c);
+                    // Remove the connection between `a` and `a2`
+                    self.remove(Edge {
+                        a,
+                        b: a2,
+                        a_port,
+                        b_port: a2_port,
+                    });
 
-                //     // Create a new edge connecting the ends of a and c
-                //     let new_edge = Edge {
-                //         a: a_outside,
-                //         b: c_outside,
-                //         a_port: a_outside_port,
-                //         b_port: c_outside_port,
-                //     }
-                //     .canonical();
-                //     self.insert(new_edge);
-
-                //     // Record the edges a and c as having been dissolved
-                //     self.dissolved_edges.insert(a, new_edge);
-                //     self.dissolved_edges.insert(c, new_edge);
-                // }
+                    // Connect `a2` to `b2`
+                    self.insert(Edge {
+                        a: a2,
+                        b: b2,
+                        a_port: a2_port,
+                        b_port: b2_port,
+                    });
+                }
                 EdgeMutation::InsertEdge(edge) => {
                     self.insert(edge);
                 }
@@ -206,6 +191,7 @@ impl Edges {
         (node_a, node_b)
     }
 
+    /// Helper to get the node and port from an edge ID.
     fn node_port_from_id(mut id: u64) -> (NodeId, Uint) {
         let port = id.get_bits(62..64);
         id.set_bits(62..64, 0);
@@ -217,16 +203,12 @@ impl Edges {
 #[derive(Debug, Clone, Copy)]
 pub enum EdgeMutation {
     /// Connect node `a`'s `a_port` to whatever node `b`s `b_port` was connected to.
-    Bridge {
-        /// The first node.
-        a: NodeId,
-        /// The first node's port.
-        a_port: Uint,
-        /// The second node.
-        b: NodeId,
-        /// The second node's port.
-        b_port: Uint,
-    },
+    Reconnect(Edge),
+    /// Connect whatever was connected to `a`s `a_port` to whatever was connected to `b`s `b_port`.
+    ///
+    /// This is similar to [`Reconnect`], but subtly different, because it doesn't connect a to b,
+    /// it connects _whatever is connect to a_, to b.
+    Bridge(Edge),
     /// Insert a new edge.
     InsertEdge(Edge),
     /// Remove an existing edge.
