@@ -14,7 +14,9 @@ Fair warning, I may not finish this, or even get anywhere with it. It's just a r
 
 ## The Algorithm
 
-**Unimplemented plan for the reduction algorithm.**
+> **Note:** Implementation is work-in-progress and has deviated a little from what's outlined here.
+> If the implementation works I'll probably write an up-to-date blog post and video with an
+> explanation of the algorithm.
 
 The idea is to be very cache efficient and almost completely eliminate random memory accesses while reducing the graph.
 
