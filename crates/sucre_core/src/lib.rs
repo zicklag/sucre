@@ -41,6 +41,61 @@ pub struct Graph {
     pub edges: Edges,
 }
 
+impl std::fmt::Debug for Graph {
+    // TODO: This is only practical for extremely small numbers of nodes and edges
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !f.alternate() {
+            f.debug_struct("Graph").finish()
+        } else {
+            writeln!(f, "Nodes:")?;
+
+            let mmap = self.nodes.lock();
+            let mut node_bytes = mmap.iter().enumerate();
+
+            'nodes: loop {
+                for _ in 0..2 {
+                    let Some((byte_idx, node_byte)) = node_bytes.next() else { break 'nodes; };
+                    for j in 0..4 {
+                        let bit_start = j * 2;
+                        let bits = bit_start..(bit_start + 2);
+                        let node_kind = node_byte.get_bits(bits);
+                        write!(
+                            f,
+                            "{:<3}: {:<8}",
+                            byte_idx * NODES_PER_BYTE + j,
+                            match NodeKind::from(node_kind) {
+                                NodeKind::Null => "N",
+                                NodeKind::Constructor => "C",
+                                NodeKind::Duplicator => "D",
+                                NodeKind::Eraser => "E",
+                            }
+                        )?;
+                    }
+                }
+
+                writeln!(f)?;
+            }
+
+            writeln!(f, "Edges:")?;
+            let mut edges = self.edges.iter();
+            'edges: loop {
+                for _ in 0..16 {
+                    let Some(edge) = edges.next() else { break 'edges; };
+                    let (lp, rp) = if edge.a_port == 0 && edge.b_port == 0 {
+                        ("(", ")")
+                    } else {
+                        (" ", " ")
+                    };
+                    write!(f, "{lp}{}:{}→{}:{}{rp} ", edge.a, edge.a_port, edge.b, edge.b_port)?;
+                }
+                writeln!(f)?;
+            }
+
+            write!(f, "")
+        }
+    }
+}
+
 impl Graph {
     /// Initialize a new graph.
     pub fn new(memory_size: usize, threads: usize) -> Self {
@@ -422,7 +477,8 @@ impl Runtime {
                                         // Null nodes should not be active
                                         //
                                         (NodeKind::Null, _) | (_, NodeKind::Null) => {
-                                            panic!("Null nodes should not be active")
+                                            // No transformations are applied for active null nodes.
+                                            // Interpretation is application dependent.
                                         }
                                     }
                                 }
@@ -543,5 +599,56 @@ impl Default for Runtime {
         return Runtime::new_thread_per_core(memory_size);
         #[cfg(not(feature = "thread_per_core"))]
         return Runtime::new(memory_size, 1);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn reduce_x_dot_xx_app_x_dot_x() {
+        let mut runtime = Runtime::new_thread_per_core(10);
+
+        // Create some nodes
+        let nodes = runtime.graph.nodes.allocate([
+            NodeKind::Constructor,
+            NodeKind::Constructor,
+            NodeKind::Constructor,
+            NodeKind::Duplicator,
+            NodeKind::Constructor,
+            NodeKind::Eraser, // Until we find out how to make a root node.
+        ]);
+        let [a, b, c, d, e, f] = std::array::from_fn(|i| nodes[i]);
+
+        // Connect them in the form of the interaction net for `(λx.xx)(λx.x)`
+        [
+            (a, 1, a, 2),
+            (a, 0, b, 1),
+            (b, 0, c, 0),
+            (c, 1, d, 0),
+            (c, 2, e, 2),
+            (d, 1, e, 1),
+            (e, 0, d, 2),
+            (b, 2, f, 0),
+        ]
+        .into_iter()
+        .for_each(|(a, ap, b, bp)| {
+            runtime.graph.edges.insert(Edge {
+                a,
+                b,
+                a_port: ap,
+                b_port: bp,
+            });
+        });
+
+        println!("{:#?}\n\n", runtime.graph);
+
+        // Reduce the graph
+        runtime.reduce();
+
+        // The graph should be reduced to nothing
+        println!("{:#?}\n\n", runtime.graph);
+        panic!();
     }
 }

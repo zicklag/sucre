@@ -31,7 +31,7 @@ impl Edges {
             0,
             "Node ID too high to store in `Edges`"
         );
-        node.set_bits(63..64, port);
+        node.set_bits(62..64, port);
         self.map.get(&node).map(|node| {
             let mut node = *node;
             let port = node.get_bits(62..64);

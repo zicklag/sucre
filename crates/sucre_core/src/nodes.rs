@@ -3,7 +3,10 @@
 use std::sync::Arc;
 
 use async_mutex::{Mutex, MutexGuardArc};
+use bit_field::BitField;
 use memmap2::{Advice, MmapMut};
+
+use crate::NodeId;
 
 /// Stores the interaction combinator nodes.
 pub struct Nodes {
@@ -51,6 +54,43 @@ impl Nodes {
             mmap: Arc::new(Mutex::new(mmap)),
             threads,
         }
+    }
+
+    /// Allocate a the given iterator of nodes, and get their node IDs.
+    #[track_caller]
+    pub fn allocate<N>(&self, nodes: N) -> Vec<NodeId>
+    where
+        N: IntoIterator<Item = NodeKind>,
+    {
+        let nodes_to_add = nodes.into_iter();
+        let mut node_ids = Vec::with_capacity(nodes_to_add.size_hint().0);
+        let mut mmap = self.mmap.try_lock().expect("Can't add nodes while locked");
+        let mut node_bytes = mmap.iter_mut().enumerate();
+
+        let mut offset = 0;
+        let (mut byte_idx, mut node_byte) = node_bytes.next().expect("Out of memory node memory");
+        'nodes: for node_kind in nodes_to_add {
+            loop {
+                if offset >= 4 {
+                    (byte_idx, node_byte) = node_bytes.next().expect("Out of node memory");
+                    offset = 0;
+                }
+                let bit_start = offset * 2;
+                let bits = bit_start..(bit_start + 2);
+
+                if node_byte.get_bits(bits.clone()) == NodeKind::Null as u8 {
+                    node_byte.set_bits(bits, node_kind as u8);
+                    let node_id = (byte_idx * NODES_PER_BYTE + offset) as NodeId;
+                    node_ids.push(node_id);
+                    offset += 1;
+                    continue 'nodes;
+                } else {
+                    offset += 1;
+                }
+            }
+        }
+
+        node_ids
     }
 
     /// Get a chunk of the memory, one for each thread, the given number of threads.
