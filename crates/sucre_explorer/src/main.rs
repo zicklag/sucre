@@ -11,12 +11,14 @@ fn main() {
     .unwrap();
 }
 
+mod graph;
 mod utils;
 mod prelude {
     pub use crate::utils::*;
     pub use eframe::egui;
     pub use egui::Widget as EguiWidget;
 }
+use prelude::*;
 
 #[derive(Default)]
 struct ExplorerApp {
@@ -26,7 +28,7 @@ struct ExplorerApp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ExplorerTab {
     #[default]
-    Heap,
+    Graph,
 }
 
 impl ExplorerApp {
@@ -45,11 +47,11 @@ impl eframe::App for ExplorerApp {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Tools:");
-                ui.selectable_value(&mut self.tab, ExplorerTab::Heap, "Heap");
+                ui.selectable_value(&mut self.tab, ExplorerTab::Graph, "Graph");
             });
         });
-        egui::CentralPanel::default().show(ctx, |_ui| match self.tab {
-            ExplorerTab::Heap => todo!(),
+        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
+            ExplorerTab::Graph => ui.add(Widget::new(graph::ui_tab)),
         });
     }
 }

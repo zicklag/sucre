@@ -4,9 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-eframe = { version = "0.21.3", features = ["persistence"] }
+eframe = { version = "0.21.3", features = ["persistence", "glow", "default_fonts"], default-features = false }
 env_logger = "0.10.0"
 fdg-sim = "0.9.1"
+sucre = { path = "../../" }
 log = "0.4.17"
 peg = "0.8.1"
-sucre = { path = "../../" }
+epaint = "0.21.0"
+rand = "0.8.5"
+

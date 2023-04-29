@@ -11,7 +11,6 @@ use crate::NodeId;
 /// Stores the interaction combinator nodes.
 pub struct Nodes {
     mmap: Arc<Mutex<MmapMut>>,
-    threads: usize,
 }
 
 impl Clone for Nodes {
@@ -26,15 +25,12 @@ impl Clone for Nodes {
 
         Self {
             mmap: Arc::new(Mutex::new(new_mmap)),
-            threads: self.threads,
         }
     }
 }
 
 impl Nodes {
     /// Create a new node storage with the given `memory_size` and thread count.
-    ///
-    /// The `memory_size` is in bytes and will be rounded up to increments of the thread count.
     ///
     /// For now, the `memory_size` is a hard limit and if the graph grows beyond the `memory_size`
     /// during reduction it will panic.
@@ -44,15 +40,11 @@ impl Nodes {
     ///
     /// TODO(perf): We need to do more careful investigation into the potential architecture of the
     /// caches and how it may effect our iteration strategy.
-    pub fn new(memory_size: usize, threads: usize) -> Self {
-        // Round the size up to an increment of L2 cache.
-        let memory_size = memory_size + (threads - (memory_size % threads));
-
+    pub fn new(memory_size: usize) -> Self {
         let mmap = MmapMut::map_anon(memory_size).expect("Could not map memory");
         mmap.advise(Advice::Sequential).ok();
         Nodes {
             mmap: Arc::new(Mutex::new(mmap)),
-            threads,
         }
     }
 
@@ -71,12 +63,12 @@ impl Nodes {
         let (mut byte_idx, mut node_byte) = node_bytes.next().expect("Out of memory node memory");
         'nodes: for node_kind in nodes_to_add {
             loop {
-                if offset >= 4 {
+                if offset >= NODES_PER_BYTE {
                     (byte_idx, node_byte) = node_bytes.next().expect("Out of node memory");
                     offset = 0;
                 }
-                let bit_start = offset * 2;
-                let bits = bit_start..(bit_start + 2);
+                let bit_start = offset * BITS_PER_NODE;
+                let bits = bit_start..(bit_start + BITS_PER_NODE);
 
                 if node_byte.get_bits(bits.clone()) == NodeKind::Null as u8 {
                     node_byte.set_bits(bits, node_kind as u8);
@@ -93,6 +85,17 @@ impl Nodes {
         node_ids
     }
 
+    /// Get the kind of the node with the given ID.
+    pub fn get(&self, node_id: NodeId) -> NodeKind {
+        let node_id: usize = node_id.try_into().unwrap();
+        let mmap = self.mmap.try_lock().unwrap();
+        let byte_idx = node_id / NODES_PER_BYTE;
+        let offset = node_id % NODES_PER_BYTE;
+        let bit_start = offset * BITS_PER_NODE;
+        let bits = bit_start..(bit_start + BITS_PER_NODE);
+        NodeKind::from(mmap[byte_idx].get_bits(bits))
+    }
+
     /// Get a chunk of the memory, one for each thread, the given number of threads.
     #[track_caller]
     pub fn lock(&self) -> MutexGuardArc<MmapMut> {
@@ -100,9 +103,47 @@ impl Nodes {
             .try_lock_arc()
             .expect("Cannot lock `Nodes`: already locked.")
     }
+
+    /// Iterate over the nodes in memory.
+    ///
+    /// **Note:** This will iterate over the _entire_ memory, returning a [`NodeKind::Null`] for all
+    /// null nodes, without skipping them.
+    pub fn iter(&self) -> NodeIter {
+        NodeIter {
+            mmap: self.lock(),
+            node_idx: 0,
+        }
+    }
 }
+
+/// An iterater over [`Nodes`].
+pub struct NodeIter {
+    mmap: MutexGuardArc<MmapMut>,
+    node_idx: usize,
+}
+
+impl Iterator for NodeIter {
+    type Item = NodeKind;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.node_idx * NODES_PER_BYTE > self.mmap.len() {
+            return None;
+        }
+        let byte_idx = self.node_idx / NODES_PER_BYTE;
+        let offset = self.node_idx % NODES_PER_BYTE;
+        let node_byte = self.mmap[byte_idx];
+        let bit_start = offset * BITS_PER_NODE;
+        let bits = bit_start..(bit_start + BITS_PER_NODE);
+
+        self.node_idx += 1;
+        Some(NodeKind::from(node_byte.get_bits(bits)))
+    }
+}
+
 /// The number of nodes stored in one byte.
-pub const NODES_PER_BYTE: usize = 4;
+pub const NODES_PER_BYTE: usize = 8 / BITS_PER_NODE;
+/// The number of bits that make up one node label.
+pub const BITS_PER_NODE: usize = 4;
 
 /// The kind of node that a node in the graph is.
 #[repr(u8)]
@@ -116,6 +157,8 @@ pub enum NodeKind {
     Duplicator = 2,
     /// The node is an eraser node.
     Eraser = 3,
+    /// The node is a root node that represents the result of the computation.
+    Root = 4,
 }
 
 impl From<u8> for NodeKind {
@@ -127,6 +170,7 @@ impl From<u8> for NodeKind {
             1 => Constructor,
             2 => Duplicator,
             3 => Eraser,
+            4 => Root,
             _ => panic!("Invalid node type"),
         }
     }

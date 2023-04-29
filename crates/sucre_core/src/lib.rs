@@ -55,9 +55,9 @@ impl std::fmt::Debug for Graph {
             'nodes: loop {
                 for _ in 0..2 {
                     let Some((byte_idx, node_byte)) = node_bytes.next() else { break 'nodes; };
-                    for j in 0..4 {
-                        let bit_start = j * 2;
-                        let bits = bit_start..(bit_start + 2);
+                    for j in 0..NODES_PER_BYTE {
+                        let bit_start = j * BITS_PER_NODE;
+                        let bits = bit_start..(bit_start + BITS_PER_NODE);
                         let node_kind = node_byte.get_bits(bits);
                         write!(
                             f,
@@ -68,6 +68,7 @@ impl std::fmt::Debug for Graph {
                                 NodeKind::Constructor => "C",
                                 NodeKind::Duplicator => "D",
                                 NodeKind::Eraser => "E",
+                                NodeKind::Root => "R",
                             }
                         )?;
                     }
@@ -86,7 +87,11 @@ impl std::fmt::Debug for Graph {
                     } else {
                         (" ", " ")
                     };
-                    write!(f, "{lp}{}:{}→{}:{}{rp} ", edge.a, edge.a_port, edge.b, edge.b_port)?;
+                    write!(
+                        f,
+                        "{lp}{}:{}→{}:{}{rp} ",
+                        edge.a, edge.a_port, edge.b, edge.b_port
+                    )?;
                 }
                 writeln!(f)?;
             }
@@ -98,9 +103,9 @@ impl std::fmt::Debug for Graph {
 
 impl Graph {
     /// Initialize a new graph.
-    pub fn new(memory_size: usize, threads: usize) -> Self {
+    pub fn new(memory_size: usize) -> Self {
         Graph {
-            nodes: Nodes::new(memory_size, threads),
+            nodes: Nodes::new(memory_size),
             edges: Edges::new(),
         }
     }
@@ -147,7 +152,7 @@ impl Runtime {
                 .num_threads(thread_count)
                 .build()
                 .unwrap(),
-            graph: Graph::new(memory_size, thread_count),
+            graph: Graph::new(memory_size),
             active_pairs: Vec::new(),
         }
     }
@@ -165,18 +170,20 @@ impl Runtime {
             .build()
             .unwrap();
         Self {
-            graph: Graph::new(memory_size, thread_count),
+            graph: Graph::new(memory_size),
             threadpool,
             active_pairs: Vec::new(),
         }
     }
 
-    /// Use the runtime to reduce the provided graph to it's normal form.
-    pub fn reduce(&mut self) {
+    /// Reduce the graph only the given number of steps before stopping.
+    ///
+    /// Returns `false` if the graph is already reduced and there is nothing to do.
+    pub fn reduce_steps(&mut self, n: usize) -> bool {
         use rayon::prelude::*;
         let thread_count = self.threadpool.current_num_threads();
 
-        loop {
+        for (steps_run, _) in (0..n).enumerate() {
             // Add all the active pairs to the buffer
             self.active_pairs.clear();
             self.active_pairs
@@ -190,7 +197,7 @@ impl Runtime {
             // If there are no active pairs
             if self.active_pairs.is_empty() {
                 // We've reached normal form, we're done.
-                break;
+                return steps_run > 0;
             }
 
             // Use our threadpool for all rayon operations ( such as par_chunks_mut, etc. )
@@ -225,8 +232,8 @@ impl Runtime {
                                     let rounded = active_pair.a as usize - offset;
                                     let node_byte_idx = rounded - chunk_node_idx_start;
 
-                                    let bit_start = offset * 2;
-                                    let bit_end = bit_start + 2;
+                                    let bit_start = offset * BITS_PER_NODE;
+                                    let bit_end = bit_start + BITS_PER_NODE;
                                     let kind = nodes[node_byte_idx].get_bits(bit_start..bit_end);
 
                                     // And store that in the active pairs list
@@ -278,8 +285,8 @@ impl Runtime {
                                     let offset = active_pair.a as usize % NODES_PER_BYTE;
                                     let rounded = active_pair.a as usize - offset;
                                     let node_byte_idx = rounded - chunk_node_idx_start;
-                                    let bit_start = offset * 2;
-                                    let bit_end = bit_start + 2;
+                                    let bit_start = offset * BITS_PER_NODE;
+                                    let bit_end = bit_start + BITS_PER_NODE;
                                     let bits = bit_start..bit_end;
 
                                     // Perform any operations required based on the kind of nodes in the pair.
@@ -474,11 +481,28 @@ impl Runtime {
                                         }
 
                                         //
+                                        // Root nodes only have one port, but since a root node
+                                        // never _interacts_ with other nodes, it's only port isn't
+                                        // _active_. Port zero is always considered an active port,
+                                        // therefore anything connected to a root node must do so on
+                                        // port 1.
+                                        //
+                                        // If a root node becomes active, then, it means we
+                                        // connected something to a root node's port 0 which is an
+                                        // error.
+                                        //
+                                        (NodeKind::Root, _) | (_, NodeKind::Root) => {
+                                            panic!(
+                                                "It is invalid to connect something to a root \
+                                                node's port 0. Connect it to port 1 instead."
+                                            )
+                                        }
+
+                                        //
                                         // Null nodes should not be active
                                         //
                                         (NodeKind::Null, _) | (_, NodeKind::Null) => {
-                                            // No transformations are applied for active null nodes.
-                                            // Interpretation is application dependent.
+                                            unreachable!("Null nodes should not be active");
                                         }
                                     }
                                 }
@@ -522,6 +546,13 @@ impl Runtime {
                     .apply_mutations(edge_mutation_receiver.try_iter());
             });
         }
+
+        true
+    }
+
+    /// Use the runtime to reduce the provided graph to it's normal form.
+    pub fn reduce(&mut self) {
+        while self.reduce_steps(1) {}
     }
 }
 
@@ -617,7 +648,7 @@ mod test {
             NodeKind::Constructor,
             NodeKind::Duplicator,
             NodeKind::Constructor,
-            NodeKind::Eraser, // Until we find out how to make a root node.
+            NodeKind::Root,
         ]);
         let [a, b, c, d, e, f] = std::array::from_fn(|i| nodes[i]);
 
@@ -645,10 +676,10 @@ mod test {
         println!("{:#?}\n\n", runtime.graph);
 
         // Reduce the graph
-        runtime.reduce();
+        while runtime.reduce_steps(1) {
+            println!("{:#?}\n\n", runtime.graph);
+        }
 
-        // The graph should be reduced to nothing
-        println!("{:#?}\n\n", runtime.graph);
         panic!();
     }
 }
