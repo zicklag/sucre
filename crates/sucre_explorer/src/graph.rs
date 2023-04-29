@@ -26,11 +26,6 @@ struct SimulationState {
     edge_velocities: HashMap<Edge, egui::Vec2>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct ForceNode {
-    kind: NodeKind,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ForceEdge {
     a_port: Uint,
