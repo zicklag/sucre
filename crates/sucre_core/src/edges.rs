@@ -1,6 +1,6 @@
 //! Contains the [`Edges`] container and iterators.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, hash::BuildHasherDefault};
 
 use super::*;
 
@@ -12,15 +12,41 @@ pub struct Edges {
     ///
     /// The first 62 bits of the u64 are used to store the node ID, and the last two bits store the
     /// port number.
-    map: HashMap<u64, u64>,
-    /// Cache of edges that have been moved during a call to [`Edges::apply_mutations`].
-    dissolved_edges: HashMap<Edge, Edge>,
+    map: HashMap<u64, u64, PassThroughBuildHasher>,
+}
+
+/// Pass-through hasher to reduce hashing cost when using u64 keys.
+#[derive(Default, Clone)]
+pub struct PassThroughHasher {
+    bytes_so_far: usize,
+    data: [u8; 8],
+}
+type PassThroughBuildHasher = BuildHasherDefault<PassThroughHasher>;
+
+impl std::hash::Hasher for PassThroughHasher {
+    fn finish(&self) -> u64 {
+        u64::from_ne_bytes(self.data)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        if self.bytes_so_far + bytes.len() <= 8 {
+            self.data[self.bytes_so_far..(self.bytes_so_far + bytes.len())].copy_from_slice(bytes);
+            self.bytes_so_far += bytes.len()
+        } else {
+            panic!("Too much data for `EntityHasher`. Will only accept 64 bits.")
+        }
+    }
 }
 
 impl Edges {
     /// Create a new, blank edges store.
-    pub fn new() -> Self {
-        Default::default()
+    pub fn new(memory_size: usize) -> Self {
+        Self {
+            map: {
+                let mut m = HashMap::default();
+                m.reserve(memory_size / NODES_PER_BYTE * 3);
+                m
+            },
+        }
     }
 
     /// Get whether or not the given nodes are connected to each-other
@@ -80,121 +106,127 @@ impl Edges {
     where
         I: IntoIterator<Item = EdgeMutation>,
     {
-        self.dissolved_edges.clear();
         let mutations = mutations.into_iter();
 
-        for mutation in mutations {
-            match mutation {
-                EdgeMutation::Reconnect(Edge {
-                    a,
-                    a_port,
-                    b,
-                    b_port,
-                }) => {
-                    // Find out what node b is connected to.
-                    let (b2, b2_port) = self.get(b, b_port).expect("missing edge");
-
-                    // Remove the connection between `b` and `b2`
-                    self.remove(Edge {
-                        a: b2,
-                        b,
-                        a_port: b2_port,
-                        b_port,
-                    });
-
-                    // Find out what node a is connected to.
-                    let (a2, a2_port) = self.get(a, a_port).expect("missing edge");
-
-                    // Remove the connection between `a` and `a2`
-                    self.remove(Edge {
-                        a,
-                        b: a2,
-                        a_port,
-                        b_port: a2_port,
-                    });
-
-                    // Connect `a` to `b2`
-                    self.insert(Edge {
-                        a,
-                        b: b2,
-                        a_port,
-                        b_port: b2_port,
-                    });
-                }
-                EdgeMutation::Bridge(Edge {
-                    a,
-                    a_port,
-                    b,
-                    b_port,
-                }) => {
-                    // Find out what node b is connected to.
-                    let (b2, b2_port) = self.get(b, b_port).expect("missing edge");
-
-                    // Remove the connection between `b` and `b2`
-                    self.remove(Edge {
-                        a: b2,
-                        b,
-                        a_port: b2_port,
-                        b_port,
-                    });
-
-                    // Find out what node a is connected to.
-                    let (a2, a2_port) = self.get(a, a_port).expect("missing edge");
-
-                    // Remove the connection between `a` and `a2`
-                    self.remove(Edge {
-                        a,
-                        b: a2,
-                        a_port,
-                        b_port: a2_port,
-                    });
-
-                    // Connect `a2` to `b2`
-                    self.insert(Edge {
-                        a: a2,
-                        b: b2,
-                        a_port: a2_port,
-                        b_port: b2_port,
-                    });
-                }
-                EdgeMutation::InsertEdge(
-                    edge @ Edge {
-                        a,
-                        b,
-                        a_port,
-                        b_port,
-                    },
-                ) => {
-                    // Find out if `a` is already connected to another node
-                    if let Some((other, other_port)) = self.get(a, a_port) {
-                        // Remove the edge between them
-                        self.remove(Edge {
-                            a,
-                            b: other,
-                            a_port,
-                            b_port: other_port,
-                        });
-                    }
-
-                    // Find out if `b` is already connected to another node
-                    if let Some((other, other_port)) = self.get(b, b_port) {
-                        // Remove the edge between them
-                        self.remove(Edge {
-                            a: b,
-                            b: other,
-                            a_port: b_port,
-                            b_port: other_port,
-                        });
-                    }
-
-                    // Insert the new edge
-                    self.insert(edge);
-                }
-                EdgeMutation::RemoveEdge(edge) => {
-                    self.remove(edge);
-                }
-            }
+        for mut mutation in mutations {
+            (mutation.0)(self)
         }
+
+        // for mutation in mutations {
+        //     dbg!(mutation);
+        //     match mutation {
+        //         EdgeMutation::Reconnect(Edge {
+        //             a,
+        //             a_port,
+        //             b,
+        //             b_port,
+        //         }) => {
+        //             // Find out what node b is connected to.
+        //             let (b2, b2_port) = self.get(b, b_port).expect("missing edge");
+
+        //             // Remove the connection between `b` and `b2`
+        //             self.remove(Edge {
+        //                 a: b2,
+        //                 b,
+        //                 a_port: b2_port,
+        //                 b_port,
+        //             });
+
+        //             // Find out what node a is connected to.
+        //             let (a2, a2_port) = self
+        //                 .get(a, a_port)
+        //                 .unwrap_or_else(|| panic!("missing edge for {a}:{a_port}"));
+
+        //             // Remove the connection between `a` and `a2`
+        //             self.remove(Edge {
+        //                 a,
+        //                 b: a2,
+        //                 a_port,
+        //                 b_port: a2_port,
+        //             });
+
+        //             // Connect `a` to `b2`
+        //             self.insert(Edge {
+        //                 a,
+        //                 b: b2,
+        //                 a_port,
+        //                 b_port: b2_port,
+        //             });
+        //         }
+        //         EdgeMutation::Bridge(Edge {
+        //             a,
+        //             a_port,
+        //             b,
+        //             b_port,
+        //         }) => {
+        //             // Find out what node b is connected to.
+        //             let (b2, b2_port) = self.get(b, b_port).expect("missing edge");
+
+        //             // Remove the connection between `b` and `b2`
+        //             self.remove(Edge {
+        //                 a: b2,
+        //                 b,
+        //                 a_port: b2_port,
+        //                 b_port,
+        //             });
+
+        //             // Find out what node a is connected to.
+        //             let (a2, a2_port) = self.get(a, a_port).expect("missing edge");
+
+        //             // Remove the connection between `a` and `a2`
+        //             self.remove(Edge {
+        //                 a,
+        //                 b: a2,
+        //                 a_port,
+        //                 b_port: a2_port,
+        //             });
+
+        //             // Connect `a2` to `b2`
+        //             self.insert(Edge {
+        //                 a: a2,
+        //                 b: b2,
+        //                 a_port: a2_port,
+        //                 b_port: b2_port,
+        //             });
+        //         }
+        //         EdgeMutation::InsertEdge(
+        //             edge @ Edge {
+        //                 a,
+        //                 b,
+        //                 a_port,
+        //                 b_port,
+        //             },
+        //         ) => {
+        //             // Find out if `a` is already connected to another node
+        //             if let Some((other, other_port)) = self.get(a, a_port) {
+        //                 // Remove the edge between them
+        //                 self.remove(Edge {
+        //                     a,
+        //                     b: other,
+        //                     a_port,
+        //                     b_port: other_port,
+        //                 });
+        //             }
+
+        //             // Find out if `b` is already connected to another node
+        //             if let Some((other, other_port)) = self.get(b, b_port) {
+        //                 // Remove the edge between them
+        //                 self.remove(Edge {
+        //                     a: b,
+        //                     b: other,
+        //                     a_port: b_port,
+        //                     b_port: other_port,
+        //                 });
+        //             }
+
+        //             // Insert the new edge
+        //             self.insert(edge);
+        //         }
+        //         EdgeMutation::RemoveEdge(edge) => {
+        //             self.remove(edge);
+        //         }
+        //     }
+        // }
     }
 
     #[track_caller]
@@ -225,20 +257,49 @@ impl Edges {
     }
 }
 
-/// A mutation that may be made to an edge in [`Edges`].
-#[derive(Debug, Clone, Copy)]
-pub enum EdgeMutation {
-    /// Connect node `a`'s `a_port` to whatever node `b`s `b_port` was connected to.
-    Reconnect(Edge),
-    /// Connect whatever was connected to `a`s `a_port` to whatever was connected to `b`s `b_port`.
-    ///
-    /// This is similar to [`Reconnect`], but subtly different, because it doesn't connect a to b,
-    /// it connects _whatever is connect to a_, to b.
-    Bridge(Edge),
-    /// Insert a new edge.
-    InsertEdge(Edge),
-    /// Remove an existing edge.
-    RemoveEdge(Edge),
+// /// A mutation that may be made to an edge in [`Edges`].
+// #[derive(Debug, Clone, Copy)]
+// pub enum EdgeMutation {
+//     /// Connect node `a`'s `a_port` to whatever node `b`s `b_port` was connected to.
+//     Reconnect(Edge),
+//     /// Connect whatever was connected to `a`s `a_port` to whatever was connected to `b`s `b_port`.
+//     ///
+//     /// This is similar to [`Reconnect`], but subtly different, because it doesn't connect a to b,
+//     /// it connects _whatever is connect to a_, to b.
+//     Bridge(Edge),
+//     /// Insert a new edge.
+//     InsertEdge(Edge),
+//     /// Remove an existing edge.
+//     RemoveEdge(Edge),
+// }
+
+/// A mutation that may be applied to [`Edges`].
+pub struct EdgeMutation(Box<dyn FnMut(&mut Edges) + Sync + Send>);
+
+pub struct PendingAllocations {
+    /// The number of new nodes to allocate.
+    count: usize,
+    /// The mutation to be applied to edges when the allocation is finished.
+    mutation: Box<dyn FnMut(&mut Edges, &[NodeId]) + Sync + Send + 'static>,
+}
+
+impl PendingAllocations {
+    pub fn new<F: FnMut(&mut Edges, &[NodeId]) + Sync + Send + 'static>(
+        count: usize,
+        f: F,
+    ) -> Self {
+        Self {
+            count,
+            mutation: Box::new(f),
+        }
+    }
+}
+
+impl EdgeMutation {
+    /// Create a new edge mutation for a closure that mutates [`Edges`].
+    pub fn new<F: FnMut(&mut Edges) + Sync + Send + 'static>(f: F) -> Self {
+        Self(Box::new(f))
+    }
 }
 
 // TODO(perf): We know that the `a_port` and `b_port` are going to be between 1 and 3, so should we
@@ -248,10 +309,10 @@ pub enum EdgeMutation {
 pub struct Edge {
     /// The first connected node.
     pub a: NodeId,
-    /// The second connected node.
-    pub b: NodeId,
     /// The port that the first node is connected by.
     pub a_port: Uint,
+    /// The second connected node.
+    pub b: NodeId,
     /// The port that the second node is connected by.
     pub b_port: Uint,
 }
@@ -344,7 +405,7 @@ mod test {
     #[test]
     /// Test [`Edges`] insertion and iteration.
     fn insert_and_iter() {
-        let mut edges = Edges::new();
+        let mut edges = Edges::new(6);
 
         // Create some nodes ( use random numbers since the nodes won't always be in order in real
         // operation )

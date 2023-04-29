@@ -50,7 +50,7 @@ c1-d0
 c2-e2
 d1-e1
 e0-d2
-b2-f0"
+b2-f1"
                 .into(),
             runtime: None,
             graph_display_simulation: Default::default(),
@@ -270,7 +270,8 @@ peg::parser! {
     rule node_kind() -> NodeKind =
         "root" { NodeKind::Root } /
         "const" { NodeKind::Constructor } /
-        "dup" { NodeKind::Duplicator }
+        "dup" { NodeKind::Duplicator } /
+        "era" { NodeKind::Eraser }
     rule node() -> (String, NodeKind) =
         kind:node_kind() _ name:$name() { (name.into(), kind) }
 

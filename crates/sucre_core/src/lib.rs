@@ -106,7 +106,7 @@ impl Graph {
     pub fn new(memory_size: usize) -> Self {
         Graph {
             nodes: Nodes::new(memory_size),
-            edges: Edges::new(),
+            edges: Edges::new(memory_size),
         }
     }
 }
@@ -181,11 +181,11 @@ impl Runtime {
     /// Returns `false` if the graph is already reduced and there is nothing to do.
     pub fn reduce_steps(&mut self, n: usize) -> bool {
         use rayon::prelude::*;
-        let thread_count = self.threadpool.current_num_threads();
 
         for (steps_run, _) in (0..n).enumerate() {
             // Add all the active pairs to the buffer
             self.active_pairs.clear();
+            dbg!(self.graph.edges.active_pairs().collect::<Vec<_>>());
             self.active_pairs
                 .extend(self.graph.edges.active_pairs().map(|(a, b)| ActivePair {
                     a,
@@ -204,7 +204,6 @@ impl Runtime {
             self.threadpool.install(|| {
                 // Lock the nodes
                 let mut mmap = self.graph.nodes.lock();
-                let mem_size = mmap.len();
 
                 // Iterate over the chunks of nodes in parallel, applying the first pass, to resolve
                 // the active nodes kinds.
@@ -228,9 +227,10 @@ impl Runtime {
                                     && node < chunk_node_idx_end as u64
                                 {
                                     // Get it's position in the chunk
-                                    let offset = active_pair.a as usize % NODES_PER_BYTE;
-                                    let rounded = active_pair.a as usize - offset;
-                                    let node_byte_idx = rounded - chunk_node_idx_start;
+                                    let offset = node as usize % NODES_PER_BYTE;
+                                    let rounded = node as usize - offset;
+                                    let node_byte_idx =
+                                        (rounded / NODES_PER_BYTE) - chunk_node_idx_start;
 
                                     let bit_start = offset * BITS_PER_NODE;
                                     let bit_end = bit_start + BITS_PER_NODE;
@@ -252,13 +252,14 @@ impl Runtime {
 
                 // Iterate over the chunks of nodes in parallel, applying the second pass, to apply
                 // annihilations, duplications, and erases.
-                mmap.par_chunks_mut(mem_size / thread_count)
+                mmap.par_chunks_mut(CHUNK_SIZE)
                     .enumerate()
                     .for_each(|(chunk_id, nodes)| {
                         // Calculate chunk position
-                        let chunk_size = nodes.len();
-                        let chunk_node_idx_start = chunk_id * chunk_size * NODES_PER_BYTE;
-                        let chunk_node_idx_end = chunk_node_idx_start + chunk_size * NODES_PER_BYTE;
+                        let this_chunk_size = nodes.len(); // The last chunk might be smaller than `CHUNK_SIZE`
+                        let chunk_node_idx_start = chunk_id * CHUNK_SIZE * NODES_PER_BYTE;
+                        let chunk_node_idx_end =
+                            chunk_node_idx_start + this_chunk_size * NODES_PER_BYTE;
 
                         // For each active pair
                         for active_pair in &self.active_pairs {
@@ -282,9 +283,10 @@ impl Runtime {
                                     && node < chunk_node_idx_end as u64
                                 {
                                     // Get it's position in the chunk
-                                    let offset = active_pair.a as usize % NODES_PER_BYTE;
-                                    let rounded = active_pair.a as usize - offset;
-                                    let node_byte_idx = rounded - chunk_node_idx_start;
+                                    let offset = node as usize % NODES_PER_BYTE;
+                                    let rounded = node as usize - offset;
+                                    let node_byte_idx =
+                                        rounded / NODES_PER_BYTE - chunk_node_idx_start;
                                     let bit_start = offset * BITS_PER_NODE;
                                     let bit_end = bit_start + BITS_PER_NODE;
                                     let bits = bit_start..bit_end;
@@ -301,33 +303,55 @@ impl Runtime {
 
                                             // The lower node is responsible for modifying the edges
                                             if node < other_node {
-                                                // Disconnect the active pair
                                                 edge_mutation_sender
-                                                    .send(EdgeMutation::RemoveEdge(Edge {
-                                                        a: node,
-                                                        a_port: 0,
-                                                        b: other_node,
-                                                        b_port: 0,
-                                                    }))
-                                                    .unwrap();
+                                                    .send(EdgeMutation::new(move |edges| {
+                                                        // Disconnect the active pair
+                                                        edges.remove(Edge {
+                                                            a: node,
+                                                            a_port: 0,
+                                                            b: other_node,
+                                                            b_port: 0,
+                                                        });
 
-                                                // Bridge port 1 of this node to port 1 of the other node.
-                                                edge_mutation_sender
-                                                    .send(EdgeMutation::Bridge(Edge {
-                                                        a: node,
-                                                        b: other_node,
-                                                        a_port: 1,
-                                                        b_port: 1,
-                                                    }))
-                                                    .unwrap();
+                                                        // Bridge the nodes
+                                                        for (a, a_port, b, b_port) in [
+                                                            (node, 1, other_node, 1),
+                                                            (node, 2, other_node, 2),
+                                                        ] {
+                                                            // Find out what node b is connected to.
+                                                            let (b2, b2_port) = edges
+                                                                .get(b, b_port)
+                                                                .expect("missing edge");
 
-                                                // Bridge port 2 of this node to port 2 of the other node.
-                                                edge_mutation_sender
-                                                    .send(EdgeMutation::Bridge(Edge {
-                                                        a: node,
-                                                        b: other_node,
-                                                        a_port: 2,
-                                                        b_port: 2,
+                                                            // Remove the connection between `b` and `b2`
+                                                            edges.remove(Edge {
+                                                                a: b2,
+                                                                b,
+                                                                a_port: b2_port,
+                                                                b_port,
+                                                            });
+
+                                                            // Find out what node a is connected to.
+                                                            let (a2, a2_port) = edges
+                                                                .get(a, a_port)
+                                                                .expect("missing edge");
+
+                                                            // Remove the connection between `a` and `a2`
+                                                            edges.remove(Edge {
+                                                                a,
+                                                                b: a2,
+                                                                a_port,
+                                                                b_port: a2_port,
+                                                            });
+
+                                                            // Connect `a2` to `b2`
+                                                            edges.insert(Edge {
+                                                                a: a2,
+                                                                b: b2,
+                                                                a_port: a2_port,
+                                                                b_port: b2_port,
+                                                            });
+                                                        }
                                                     }))
                                                     .unwrap();
                                             }
@@ -338,83 +362,84 @@ impl Runtime {
                                         //
                                         (NodeKind::Constructor, NodeKind::Duplicator)
                                         | (NodeKind::Duplicator, NodeKind::Constructor) => {
+                                            println!("Duplicate");
                                             // The lower node is repsonsible for modifying the edges appropriately
                                             if node < other_node {
                                                 // Switch this node to the kind of the other node
                                                 nodes[node_byte_idx]
                                                     .set_bits(bits, other_node_kind as u8);
 
-                                                // Connect this node's port 0 to whatever was connected to it's own port 1
-                                                edge_mutation_sender
-                                                    .send(EdgeMutation::Reconnect(Edge {
-                                                        a: node,
-                                                        b: node,
-                                                        a_port: 0,
-                                                        b_port: 1,
-                                                    }))
-                                                    .unwrap();
+                                                //     // Connect this node's port 0 to whatever was connected to it's own port 1
+                                                //     edge_mutation_sender
+                                                //         .send(EdgeMutation::Reconnect(Edge {
+                                                //             a: node,
+                                                //             b: node,
+                                                //             a_port: 0,
+                                                //             b_port: 1,
+                                                //         }))
+                                                //         .unwrap();
 
-                                                // Connect the other node's port 0 whatever was connected to our port 2
-                                                edge_mutation_sender
-                                                    .send(EdgeMutation::Reconnect(Edge {
-                                                        a: other_node,
-                                                        b: node,
-                                                        a_port: 0,
-                                                        b_port: 2,
-                                                    }))
-                                                    .unwrap();
+                                                //     // Connect the other node's port 0 whatever was connected to it's port 2
+                                                //     edge_mutation_sender
+                                                //         .send(EdgeMutation::Reconnect(Edge {
+                                                //             a: other_node,
+                                                //             b: node,
+                                                //             a_port: 0,
+                                                //             b_port: 2,
+                                                //         }))
+                                                //         .unwrap();
 
-                                                // Allocate the other two nodes
-                                                pending_allocation_sender
-                                                    .send(PendingAllocation {
-                                                        kind: node_kind,
-                                                        edge_mutations: [
-                                                            Some(EdgeMutation::Reconnect(Edge {
-                                                                a: 0, // This will be filled in with the allocated node
-                                                                b: other_node,
-                                                                a_port: 0,
-                                                                b_port: 2,
-                                                            })),
-                                                            Some(EdgeMutation::InsertEdge(Edge {
-                                                                a: 0,
-                                                                b: node,
-                                                                a_port: 1,
-                                                                b_port: 2,
-                                                            })),
-                                                            Some(EdgeMutation::InsertEdge(Edge {
-                                                                a: 0,
-                                                                b: other_node,
-                                                                a_port: 2,
-                                                                b_port: 2,
-                                                            })),
-                                                        ],
-                                                    })
-                                                    .unwrap();
-                                                pending_allocation_sender
-                                                    .send(PendingAllocation {
-                                                        kind: node_kind,
-                                                        edge_mutations: [
-                                                            Some(EdgeMutation::Reconnect(Edge {
-                                                                a: 0,
-                                                                b: other_node,
-                                                                a_port: 0,
-                                                                b_port: 1,
-                                                            })),
-                                                            Some(EdgeMutation::InsertEdge(Edge {
-                                                                a: 0,
-                                                                b: other_node,
-                                                                a_port: 2,
-                                                                b_port: 1,
-                                                            })),
-                                                            Some(EdgeMutation::InsertEdge(Edge {
-                                                                a: 0,
-                                                                b: node,
-                                                                a_port: 1,
-                                                                b_port: 1,
-                                                            })),
-                                                        ],
-                                                    })
-                                                    .unwrap();
+                                                //     // Allocate the other two nodes
+                                                //     pending_allocation_sender
+                                                //         .send(PendingAllocation {
+                                                //             kind: node_kind,
+                                                //             edge_mutations: [
+                                                //                 Some(EdgeMutation::Reconnect(Edge {
+                                                //                     a: 0, // This will be filled in with the allocated node
+                                                //                     b: other_node,
+                                                //                     a_port: 0,
+                                                //                     b_port: 1,
+                                                //                 })),
+                                                //                 Some(EdgeMutation::InsertEdge(Edge {
+                                                //                     a: 0,
+                                                //                     b: node,
+                                                //                     a_port: 1,
+                                                //                     b_port: 2,
+                                                //                 })),
+                                                //                 Some(EdgeMutation::InsertEdge(Edge {
+                                                //                     a: 0,
+                                                //                     b: other_node,
+                                                //                     a_port: 2,
+                                                //                     b_port: 2,
+                                                //                 })),
+                                                //             ],
+                                                //         })
+                                                //         .unwrap();
+                                                //     pending_allocation_sender
+                                                //         .send(PendingAllocation {
+                                                //             kind: node_kind,
+                                                //             edge_mutations: [
+                                                //                 Some(EdgeMutation::Reconnect(Edge {
+                                                //                     a: 0,
+                                                //                     b: other_node,
+                                                //                     a_port: 0,
+                                                //                     b_port: 1,
+                                                //                 })),
+                                                //                 Some(EdgeMutation::InsertEdge(Edge {
+                                                //                     a: 0,
+                                                //                     b: other_node,
+                                                //                     a_port: 2,
+                                                //                     b_port: 1,
+                                                //                 })),
+                                                //                 Some(EdgeMutation::InsertEdge(Edge {
+                                                //                     a: 0,
+                                                //                     b: node,
+                                                //                     a_port: 1,
+                                                //                     b_port: 1,
+                                                //                 })),
+                                                //             ],
+                                                //         })
+                                                //         .unwrap();
                                             }
                                         }
 
@@ -433,14 +458,35 @@ impl Runtime {
                                             nodes[node_byte_idx]
                                                 .set_bits(bits, NodeKind::Eraser as u8);
 
-                                            // Connect whatever node was connected to our port 2, to
-                                            // our new port 0.
                                             edge_mutation_sender
-                                                .send(EdgeMutation::Reconnect(Edge {
-                                                    a: node,
-                                                    a_port: 0,
-                                                    b: node,
-                                                    b_port: 2,
+                                                .send(EdgeMutation::new(move |edges| {
+                                                    let (c, c_port) = edges.get(node, 1).unwrap();
+                                                    edges.remove(Edge {
+                                                        a: node,
+                                                        a_port: 1,
+                                                        b: c,
+                                                        b_port: c_port,
+                                                    });
+                                                    edges.insert(Edge {
+                                                        a: other_node,
+                                                        a_port: 0,
+                                                        b: c,
+                                                        b_port: c_port,
+                                                    });
+
+                                                    let (d, d_port) = edges.get(node, 2).unwrap();
+                                                    edges.remove(Edge {
+                                                        a: node,
+                                                        a_port: 2,
+                                                        b: d,
+                                                        b_port: d_port,
+                                                    });
+                                                    edges.insert(Edge {
+                                                        a: node,
+                                                        a_port: 0,
+                                                        b: d,
+                                                        b_port: d_port,
+                                                    });
                                                 }))
                                                 .unwrap();
                                         }
@@ -448,16 +494,26 @@ impl Runtime {
                                             NodeKind::Eraser,
                                             NodeKind::Duplicator | NodeKind::Constructor,
                                         ) => {
-                                            // This node will stay an eraser, and we'll connect it
-                                            // the node connected to the duplicator/constructor's port 1.
-                                            edge_mutation_sender
-                                                .send(EdgeMutation::Reconnect(Edge {
-                                                    a: node,
-                                                    a_port: 0,
-                                                    b: other_node,
-                                                    b_port: 1,
-                                                }))
-                                                .unwrap();
+                                            // // This node will stay an eraser, and we'll connect it
+                                            // // the node connected to the duplicator/constructor's port 1.
+                                            // edge_mutation_sender
+                                            //     .send(EdgeMutation::new(move |edges| {
+                                            //         let (c, c_port) =
+                                            //             edges.get(other_node, 1).unwrap();
+                                            //         edges.remove(Edge {
+                                            //             a: node,
+                                            //             b: other_node,
+                                            //             a_port: 0,
+                                            //             b_port: 0,
+                                            //         });
+                                            //         edges.insert(Edge {
+                                            //             a: node,
+                                            //             b: c,
+                                            //             a_port: 0,
+                                            //             b_port: c_port,
+                                            //         });
+                                            //     }))
+                                            //     .unwrap();
                                         }
 
                                         //
@@ -470,11 +526,13 @@ impl Runtime {
                                             // The lower node is in charge of deleting the edge
                                             if node < other_node {
                                                 edge_mutation_sender
-                                                    .send(EdgeMutation::RemoveEdge(Edge {
-                                                        a: node,
-                                                        b: other_node,
-                                                        a_port: 0,
-                                                        b_port: 0,
+                                                    .send(EdgeMutation::new(move |edges| {
+                                                        edges.remove(Edge {
+                                                            a: node,
+                                                            b: other_node,
+                                                            a_port: 0,
+                                                            b_port: 0,
+                                                        });
                                                     }))
                                                     .unwrap();
                                             }
@@ -597,23 +655,23 @@ fn handle_pending_allocations<'a, N, A>(
                 // Get the newly alllocated node's id
                 let node_id = (node_start_idx + node_byte_idx * NODES_PER_BYTE + i) as u64;
 
-                // For every edge mutation for this allocation
-                for mutation in pending_allocation.edge_mutations {
-                    let Some(mut mutation) = mutation else { continue; };
+                // // For every edge mutation for this allocation
+                // for mutation in pending_allocation.edge_mutations {
+                //     let Some(mut mutation) = mutation else { continue; };
 
-                    // Replace the `a` node in the mutation with the allocated node's id
-                    match &mut mutation {
-                        EdgeMutation::Reconnect(edge)
-                        | EdgeMutation::Bridge(edge)
-                        | EdgeMutation::InsertEdge(edge)
-                        | EdgeMutation::RemoveEdge(edge) => {
-                            edge.a = node_id;
-                        }
-                    }
+                //     // Replace the `a` node in the mutation with the allocated node's id
+                //     match &mut mutation {
+                //         EdgeMutation::Reconnect(edge)
+                //         | EdgeMutation::Bridge(edge)
+                //         | EdgeMutation::InsertEdge(edge)
+                //         | EdgeMutation::RemoveEdge(edge) => {
+                //             edge.a = node_id;
+                //         }
+                //     }
 
-                    // Queue the mutation
-                    edge_mutation_sender.send(mutation).unwrap();
-                }
+                //     // Queue the mutation
+                //     edge_mutation_sender.send(mutation).unwrap();
+                // }
 
                 break 'allocation;
             }
