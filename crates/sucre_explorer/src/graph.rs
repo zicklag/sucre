@@ -340,7 +340,6 @@ impl SimulationState {
 
         // TODO: avoid cloning the entire nodes/edges vec like this
         let nodes = graph.nodes.iter_non_null().map(|x| x.0).collect::<Vec<_>>();
-        let edges = graph.edges.iter().collect::<Vec<_>>();
 
         let mut rng = rand::thread_rng();
         for node in nodes.iter().copied() {
@@ -431,7 +430,7 @@ impl SimulationState {
             self.node_positions.insert(node_id, pos + *vel * dt);
         }
 
-        for edge in edges.iter().copied() {
+        for edge in graph.edges.iter() {
             let mut force = egui::Vec2::ZERO;
             let pos = old_state.edge_positions.get(&edge).copied().unwrap();
 
@@ -439,7 +438,7 @@ impl SimulationState {
             force += {
                 let mut f = egui::Vec2::ZERO;
 
-                for other_edge in edges.iter().copied() {
+                for other_edge in graph.edges.iter() {
                     if edge == other_edge {
                         continue;
                     };

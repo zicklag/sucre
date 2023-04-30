@@ -1,11 +1,11 @@
 //! Contains the [`Edges`] container and iterators.
 
-use std::sync::Arc;
-
-use async_mutex::{Mutex, MutexGuardArc};
 use crossbeam_channel::bounded;
 use memmap2::MmapMut;
-use rayon::{prelude::ParallelIterator, slice::ParallelSliceMut};
+use rayon::{
+    prelude::ParallelIterator,
+    slice::{ParallelSlice, ParallelSliceMut},
+};
 
 use super::*;
 
@@ -18,9 +18,17 @@ pub const EDGE_SIZE: usize = std::mem::size_of::<u64>() * U64S_PER_EDGE;
 pub const U64S_PER_EDGE: usize = 2;
 
 /// Compressed adjacency matrix for storing node connections.
-#[derive(Clone)]
 pub struct Edges {
-    mmap: Arc<Mutex<MmapMut>>,
+    mmap: MmapMut,
+}
+
+impl Clone for Edges {
+    fn clone(&self) -> Self {
+        let mut mmap = MmapMut::map_anon(self.mmap.len()).unwrap();
+        mmap.advise(memmap2::Advice::Sequential).ok();
+        mmap.copy_from_slice(&self.mmap);
+        Self { mmap }
+    }
 }
 
 impl Edges {
@@ -31,11 +39,9 @@ impl Edges {
             memory_size > EDGE_SIZE * 16,
             "edge memory size is too small"
         );
-        Self {
-            mmap: Arc::new(Mutex::new(
-                MmapMut::map_anon(memory_size + (memory_size % EDGE_SIZE)).unwrap(),
-            )),
-        }
+        let mmap = MmapMut::map_anon(memory_size + (memory_size % EDGE_SIZE)).unwrap();
+        mmap.advise(memmap2::Advice::Sequential).ok();
+        Self { mmap }
     }
 
     /// Allocate the edges in the given iterator in parallel.
@@ -43,8 +49,6 @@ impl Edges {
     /// Returns `true` if the edge did not previously exist.
     #[track_caller]
     pub fn allocate<I: ExactSizeIterator<Item = Edge>>(&mut self, edges: I) {
-        let mut mmap = self.mmap.try_lock().unwrap();
-
         // Fill a channel with all the edges we need to allocate
         let (sender, receiver) = bounded(edges.len());
         for edge in edges {
@@ -52,7 +56,7 @@ impl Edges {
         }
 
         // Cast our memory to from bytes to u64s to make it easier to extract our edge data from it.
-        let u64s: &mut [u64] = bytemuck::cast_slice_mut(&mut mmap[..]);
+        let u64s: &mut [u64] = bytemuck::cast_slice_mut(&mut self.mmap[..]);
 
         // While there are still edges to allocate
         while !receiver.is_empty() {
@@ -84,7 +88,7 @@ impl Edges {
                                 );
 
                                 // Allocate the edge here
-                                let (id1, id2) = Self::ids_for_edge(edge_to_alloc);
+                                let (id1, id2) = Self::ids_from_edge(edge_to_alloc);
                                 edge[0] = id1;
                                 edge[1] = id2;
 
@@ -104,31 +108,65 @@ impl Edges {
 
     /// Count the edges.
     pub fn count(&self) -> usize {
-        self.mmap.try_lock().unwrap().len() / EDGE_SIZE
+        self.mmap.len() / EDGE_SIZE
     }
 
     /// Iterate over all of the pairs of nodes in the graph.
-    #[track_caller]
-    pub fn iter(&self) -> EdgeIter {
-        EdgeIter::new(
-            self.mmap
-                .try_lock_arc()
-                .expect("Can't iter: Edges is locked"),
-        )
+    pub fn iter(&self) -> impl Iterator<Item = Edge> + '_ {
+        self.as_u64s()
+            .chunks_exact(U64S_PER_EDGE)
+            .filter_map(Self::edge_for_ids)
     }
 
-    /// Iterate over all of the **active** pairs in the graph.
-    ///
-    /// An active pair is a pair of nodes connected by their `0` ports.
-    pub fn active_pairs(&self) -> ActivePairIter {
-        ActivePairIter(self.iter())
+    /// Iterate over all of the **active** pairs of nodes in the graph.
+    pub fn active_pairs(&self) -> impl Iterator<Item = (NodeId, NodeId)> + '_ {
+        self.iter()
+            .filter(|e| e.a_port == 0 && e.b_port == 0)
+            .map(|e| (e.a, e.b))
+    }
+
+    /// Iterate in parallel over all the pairs of nodes in the graph.
+    pub fn par_iter(&self) -> impl ParallelIterator<Item = Edge> + '_ {
+        self.as_u64s()
+            .par_chunks_exact(U64S_PER_EDGE)
+            .filter_map(Self::edge_for_ids)
+    }
+
+    /// Iterate in parallel over all of the **active** pairs of nodes in the graph.
+    pub fn par_active_pairs(&self) -> impl ParallelIterator<Item = (NodeId, NodeId)> + '_ {
+        self.par_iter()
+            .filter(|e| e.a_port == 0 && e.b_port == 0)
+            .map(|e| (e.a, e.b))
+    }
+}
+
+/// Internal helper functions
+impl Edges {
+    // Helper to borrow the internal mmap as a slice of u64s
+    fn as_u64s(&self) -> &[u64] {
+        bytemuck::cast_slice(&self.mmap[..])
+    }
+
+    /// Helper to get the edge stored in the given two u64s.
+    fn edge_for_ids(ids: &[u64]) -> Option<Edge> {
+        debug_assert_eq!(ids.len(), 2);
+        Self::node_port_from_id(ids[0]).map(|(a, a_port)| {
+            let (b, b_port) = Self::node_port_from_id(ids[1]).expect("Half edge");
+
+            Edge {
+                a,
+                a_port,
+                b,
+                b_port,
+            }
+        })
     }
 
     /// Helper to get the idx of an edge in the bitmap, given the nodes that it connects.
     #[track_caller]
-    fn ids_for_edge(edge: Edge) -> (u64, u64) {
-        let node_a = Self::id_for_node_port(edge.a, edge.a_port);
-        let node_b = Self::id_for_node_port(edge.b, edge.b_port);
+    fn ids_from_edge(edge: Edge) -> (u64, u64) {
+        let node_a = Self::id_from_node_port(edge.a, edge.a_port);
+        let node_b = Self::id_from_node_port(edge.b, edge.b_port);
         (node_a, node_b)
     }
 
@@ -141,7 +179,7 @@ impl Edges {
     ///
     /// Since port 0 is a valid port number, we encode a port of zero as 1.
     #[track_caller]
-    fn id_for_node_port(mut node: NodeId, port: Uint) -> u64 {
+    fn id_from_node_port(mut node: NodeId, port: Uint) -> u64 {
         assert!(port < 3, "Port is too high.");
         assert_eq!(
             node.get_bits(62..64),
@@ -208,67 +246,13 @@ impl From<(NodeId, Uint, NodeId, Uint)> for Edge {
     }
 }
 
-/// Iterator over the pairs of connected nodes in an [`Edges`] store.
-pub struct EdgeIter {
-    mmap: MutexGuardArc<MmapMut>,
-    edge_idx: usize,
-}
-
-impl EdgeIter {
-    fn new(mmap: MutexGuardArc<MmapMut>) -> Self {
-        Self { mmap, edge_idx: 0 }
-    }
-}
-
-impl Iterator for EdgeIter {
-    type Item = Edge;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.edge_idx * EDGE_SIZE >= self.mmap.len() {
-                break None;
-            }
-            let idx = self.edge_idx;
-            self.edge_idx += 1;
-            let u64s: &[u64] = bytemuck::cast_slice(&self.mmap[..]);
-
-            let id1 = u64s[idx * U64S_PER_EDGE];
-            let id2 = u64s[idx * U64S_PER_EDGE + 1];
-
-            let Some((a, a_port)) = Edges::node_port_from_id(id1) else {continue;};
-            let (b, b_port) = Edges::node_port_from_id(id2).expect("Found only edge data");
-            break Some(Edge {
-                a,
-                a_port,
-                b,
-                b_port,
-            });
-        }
-    }
-}
-
-/// Iterator over the active pairs in an [`Edges`] store.
-pub struct ActivePairIter(EdgeIter);
-
-impl Iterator for ActivePairIter {
-    type Item = (NodeId, NodeId);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.0
-            .by_ref()
-            .filter(|pair| pair.a_port == 0 && pair.b_port == 0)
-            .map(|pair| (pair.a, pair.b))
-            .next()
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
 
     #[test]
     /// Test [`Edges`] insertion and iteration.
-    fn insert_and_iter() {
+    fn allocate_and_iter() {
         let mut edges = Edges::new(1024);
 
         // Create some nodes ( use random numbers since the nodes won't always be in order in real

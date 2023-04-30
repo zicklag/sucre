@@ -61,8 +61,8 @@ impl std::fmt::Debug for Graph {
                         node_id,
                         match node_kind {
                             NodeKind::Null => "N",
-                            NodeKind::Constructor => "C",
-                            NodeKind::Duplicator => "D",
+                            NodeKind::Constructor => "γ",
+                            NodeKind::Duplicator => "δ",
                             NodeKind::Eraser => "E",
                             NodeKind::Root => "R",
                         }
@@ -181,7 +181,6 @@ impl Runtime {
         for (steps_run, _) in (0..n).enumerate() {
             // Add all the active pairs to the buffer
             self.active_pairs.clear();
-            dbg!(self.graph.edges.active_pairs().collect::<Vec<_>>());
             self.active_pairs
                 .extend(self.graph.edges.active_pairs().map(|(a, b)| ActivePair {
                     a,
@@ -198,12 +197,12 @@ impl Runtime {
 
             // Use our threadpool for all rayon operations ( such as par_chunks_mut, etc. )
             self.threadpool.install(|| {
-                // Lock the nodes
-                let mut mmap = self.graph.nodes.lock();
-
                 // Iterate over the chunks of nodes in parallel, applying the first pass, to resolve
                 // the active nodes kinds.
-                mmap.par_chunks(CHUNK_SIZE)
+                self.graph
+                    .nodes
+                    .mmap
+                    .par_chunks(CHUNK_SIZE)
                     .enumerate()
                     .for_each(|(chunk_id, nodes)| {
                         // Calculate chunk position
@@ -248,7 +247,10 @@ impl Runtime {
 
                 // Iterate over the chunks of nodes in parallel, applying the second pass, to apply
                 // annihilations, duplications, and erases.
-                mmap.par_chunks_mut(CHUNK_SIZE)
+                self.graph
+                    .nodes
+                    .mmap
+                    .par_chunks_mut(CHUNK_SIZE)
                     .enumerate()
                     .for_each(|(chunk_id, nodes)| {
                         // Calculate chunk position
@@ -576,7 +578,7 @@ impl Runtime {
 
                 // Handle any remaining allocations that weren't finished during the chunk evaluation.
                 // Check for any pending allocations from other chunks
-                let nodes = mmap.iter_mut();
+                let nodes = self.graph.nodes.mmap.iter_mut();
                 handle_pending_allocations(
                     nodes,
                     0,
