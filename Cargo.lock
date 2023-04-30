@@ -1927,6 +1927,7 @@ version = "0.1.0"
 dependencies = [
  "async-mutex",
  "bit_field",
+ "bytemuck",
  "crossbeam-channel",
  "memmap2",
  "num_cpus",

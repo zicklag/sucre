@@ -1,97 +1,120 @@
 //! Contains the [`Edges`] container and iterators.
 
-use std::{collections::HashMap, hash::BuildHasherDefault};
+use std::sync::Arc;
+
+use async_mutex::{Mutex, MutexGuardArc};
+use crossbeam_channel::bounded;
+use memmap2::MmapMut;
+use rayon::{prelude::ParallelIterator, slice::ParallelSliceMut};
 
 use super::*;
 
+/// The size of an edge in bytes.
+pub const EDGE_SIZE: usize = std::mem::size_of::<u64>() * U64S_PER_EDGE;
+
+/// The number of [`u64`]s per edge storage.
+///
+/// Each edge is made up of 2 [`u64`]s.
+pub const U64S_PER_EDGE: usize = 2;
+
 /// Compressed adjacency matrix for storing node connections.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Edges {
-    /// Hash map that stores edges by mapping a node and port to the node and port that it's
-    /// connected to.
-    ///
-    /// The first 62 bits of the u64 are used to store the node ID, and the last two bits store the
-    /// port number.
-    map: HashMap<u64, u64, PassThroughBuildHasher>,
-}
-
-/// Pass-through hasher to reduce hashing cost when using u64 keys.
-#[derive(Default, Clone)]
-pub struct PassThroughHasher {
-    bytes_so_far: usize,
-    data: [u8; 8],
-}
-type PassThroughBuildHasher = BuildHasherDefault<PassThroughHasher>;
-
-impl std::hash::Hasher for PassThroughHasher {
-    fn finish(&self) -> u64 {
-        u64::from_ne_bytes(self.data)
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        if self.bytes_so_far + bytes.len() <= 8 {
-            self.data[self.bytes_so_far..(self.bytes_so_far + bytes.len())].copy_from_slice(bytes);
-            self.bytes_so_far += bytes.len()
-        } else {
-            panic!("Too much data for `EntityHasher`. Will only accept 64 bits.")
-        }
-    }
+    mmap: Arc<Mutex<MmapMut>>,
 }
 
 impl Edges {
     /// Create a new, blank edges store.
+    #[track_caller]
     pub fn new(memory_size: usize) -> Self {
+        assert!(
+            memory_size > EDGE_SIZE * 16,
+            "edge memory size is too small"
+        );
         Self {
-            map: {
-                let mut m = HashMap::default();
-                m.reserve(memory_size / NODES_PER_BYTE * 3);
-                m
-            },
+            mmap: Arc::new(Mutex::new(
+                MmapMut::map_anon(memory_size + (memory_size % EDGE_SIZE)).unwrap(),
+            )),
         }
     }
 
-    /// Get whether or not the given nodes are connected to each-other
-    #[track_caller]
-    pub fn get(&self, mut node: u64, port: Uint) -> Option<(u64, Uint)> {
-        assert_eq!(
-            node.get_bits(62..64),
-            0,
-            "Node ID too high to store in `Edges`"
-        );
-        node.set_bits(62..64, port);
-        self.map.get(&node).map(|node| {
-            let mut node = *node;
-            let port = node.get_bits(62..64);
-            node.set_bits(62..64, 0);
-            (node, port)
-        })
-    }
-
-    /// Insert an edge between the two given nodes.
+    /// Allocate the edges in the given iterator in parallel.
     ///
     /// Returns `true` if the edge did not previously exist.
     #[track_caller]
-    pub fn insert(&mut self, edge: Edge) -> bool {
-        let (a, b) = Self::ids_for_edge(edge);
-        self.map.insert(a, b).is_none() && self.map.insert(b, a).is_none()
-    }
+    pub fn allocate<I: ExactSizeIterator<Item = Edge>>(&mut self, edges: I) {
+        let mut mmap = self.mmap.try_lock().unwrap();
 
-    /// Remove an edge between two nodes.
-    ///
-    /// Returns `true` if the edge previously existed.
-    pub fn remove(&mut self, edge: Edge) -> bool {
-        let (a, b) = Self::ids_for_edge(edge);
-        self.map.remove(&a).is_some() && self.map.remove(&b).is_some()
+        // Fill a channel with all the edges we need to allocate
+        let (sender, receiver) = bounded(edges.len());
+        for edge in edges {
+            sender.send(edge).unwrap();
+        }
+
+        // Cast our memory to from bytes to u64s to make it easier to extract our edge data from it.
+        let u64s: &mut [u64] = bytemuck::cast_slice_mut(&mut mmap[..]);
+
+        // While there are still edges to allocate
+        while !receiver.is_empty() {
+            // Iterate over the memory in parallel
+            // TODO(perf): evaluate whether it's more efficient to iterate in chunks like this,
+            // or whether it's better to to iterate over every edge slot.
+            u64s.par_chunks_mut(CHUNK_SIZE / EDGE_SIZE)
+                .for_each(|chunk| {
+                    // Split the chunk into edges
+                    let mut edges = chunk.chunks_mut(U64S_PER_EDGE);
+
+                    // For every edge we need to allocate
+                    'edges: for edge_to_alloc in receiver.try_iter() {
+                        loop {
+                            // Get the next edge in our chunk
+                            let Some(edge) = edges.next() else {
+                            // If we have run out of spots in our chunk,
+                            // send the edge back into the allocation queue,
+                            // because we don't have a spot for it.
+                            sender.send(edge_to_alloc).unwrap();
+                            return;
+                        };
+
+                            // If this slot doesn't contain an edge
+                            if Self::node_port_from_id(edge[0]).is_none() {
+                                debug_assert!(
+                                    Self::node_port_from_id(edge[1]).is_none(),
+                                    "Found a half-allocated edge."
+                                );
+
+                                // Allocate the edge here
+                                let (id1, id2) = Self::ids_for_edge(edge_to_alloc);
+                                edge[0] = id1;
+                                edge[1] = id2;
+
+                                // Try to allocate the next edge
+                                continue 'edges;
+
+                            // There's no open spot here
+                            } else {
+                                // Check the next spot
+                                continue;
+                            }
+                        }
+                    }
+                });
+        }
     }
 
     /// Count the edges.
     pub fn count(&self) -> usize {
-        // Divide length by two because we have two entries for each edge.
-        self.map.len() / 2
+        self.mmap.try_lock().unwrap().len() / EDGE_SIZE
     }
 
     /// Iterate over all of the pairs of nodes in the graph.
+    #[track_caller]
     pub fn iter(&self) -> EdgeIter {
-        EdgeIter::new(self.map.iter())
+        EdgeIter::new(
+            self.mmap
+                .try_lock_arc()
+                .expect("Can't iter: Edges is locked"),
+        )
     }
 
     /// Iterate over all of the **active** pairs in the graph.
@@ -99,146 +122,6 @@ impl Edges {
     /// An active pair is a pair of nodes connected by their `0` ports.
     pub fn active_pairs(&self) -> ActivePairIter {
         ActivePairIter(self.iter())
-    }
-
-    /// Apply an iterator of mutations to the edge store.
-    pub fn apply_mutations<I>(&mut self, mutations: I)
-    where
-        I: IntoIterator<Item = EdgeMutation>,
-    {
-        let mutations = mutations.into_iter();
-
-        for mut mutation in mutations {
-            (mutation.0)(self)
-        }
-
-        // for mutation in mutations {
-        //     dbg!(mutation);
-        //     match mutation {
-        //         EdgeMutation::Reconnect(Edge {
-        //             a,
-        //             a_port,
-        //             b,
-        //             b_port,
-        //         }) => {
-        //             // Find out what node b is connected to.
-        //             let (b2, b2_port) = self.get(b, b_port).expect("missing edge");
-
-        //             // Remove the connection between `b` and `b2`
-        //             self.remove(Edge {
-        //                 a: b2,
-        //                 b,
-        //                 a_port: b2_port,
-        //                 b_port,
-        //             });
-
-        //             // Find out what node a is connected to.
-        //             let (a2, a2_port) = self
-        //                 .get(a, a_port)
-        //                 .unwrap_or_else(|| panic!("missing edge for {a}:{a_port}"));
-
-        //             // Remove the connection between `a` and `a2`
-        //             self.remove(Edge {
-        //                 a,
-        //                 b: a2,
-        //                 a_port,
-        //                 b_port: a2_port,
-        //             });
-
-        //             // Connect `a` to `b2`
-        //             self.insert(Edge {
-        //                 a,
-        //                 b: b2,
-        //                 a_port,
-        //                 b_port: b2_port,
-        //             });
-        //         }
-        //         EdgeMutation::Bridge(Edge {
-        //             a,
-        //             a_port,
-        //             b,
-        //             b_port,
-        //         }) => {
-        //             // Find out what node b is connected to.
-        //             let (b2, b2_port) = self.get(b, b_port).expect("missing edge");
-
-        //             // Remove the connection between `b` and `b2`
-        //             self.remove(Edge {
-        //                 a: b2,
-        //                 b,
-        //                 a_port: b2_port,
-        //                 b_port,
-        //             });
-
-        //             // Find out what node a is connected to.
-        //             let (a2, a2_port) = self.get(a, a_port).expect("missing edge");
-
-        //             // Remove the connection between `a` and `a2`
-        //             self.remove(Edge {
-        //                 a,
-        //                 b: a2,
-        //                 a_port,
-        //                 b_port: a2_port,
-        //             });
-
-        //             // Connect `a2` to `b2`
-        //             self.insert(Edge {
-        //                 a: a2,
-        //                 b: b2,
-        //                 a_port: a2_port,
-        //                 b_port: b2_port,
-        //             });
-        //         }
-        //         EdgeMutation::InsertEdge(
-        //             edge @ Edge {
-        //                 a,
-        //                 b,
-        //                 a_port,
-        //                 b_port,
-        //             },
-        //         ) => {
-        //             // Find out if `a` is already connected to another node
-        //             if let Some((other, other_port)) = self.get(a, a_port) {
-        //                 // Remove the edge between them
-        //                 self.remove(Edge {
-        //                     a,
-        //                     b: other,
-        //                     a_port,
-        //                     b_port: other_port,
-        //                 });
-        //             }
-
-        //             // Find out if `b` is already connected to another node
-        //             if let Some((other, other_port)) = self.get(b, b_port) {
-        //                 // Remove the edge between them
-        //                 self.remove(Edge {
-        //                     a: b,
-        //                     b: other,
-        //                     a_port: b_port,
-        //                     b_port: other_port,
-        //                 });
-        //             }
-
-        //             // Insert the new edge
-        //             self.insert(edge);
-        //         }
-        //         EdgeMutation::RemoveEdge(edge) => {
-        //             self.remove(edge);
-        //         }
-        //     }
-        // }
-    }
-
-    #[track_caller]
-    fn id_for_node_port(mut node: NodeId, port: Uint) -> u64 {
-        assert!(port < 3, "Port is too high.");
-        assert_eq!(
-            node.get_bits(62..64),
-            0,
-            "Node ID too high to store in `Edges`"
-        );
-        node.set_bits(62..64, port);
-        node
     }
 
     /// Helper to get the idx of an edge in the bitmap, given the nodes that it connects.
@@ -249,56 +132,35 @@ impl Edges {
         (node_a, node_b)
     }
 
+    /// Helper to get the u64 id for a node⋄port pair.
+    ///
+    /// The pair is encoded with the first 62 bits used for the node ID and the last 2 bits used to
+    /// represent the port.
+    ///
+    /// The ID could also represent a null node, in which case the port will be 0.
+    ///
+    /// Since port 0 is a valid port number, we encode a port of zero as 1.
+    #[track_caller]
+    fn id_for_node_port(mut node: NodeId, port: Uint) -> u64 {
+        assert!(port < 3, "Port is too high.");
+        assert_eq!(
+            node.get_bits(62..64),
+            0,
+            "Node ID too high to store in `Edges`"
+        );
+        node.set_bits(62..64, port + 1);
+        node
+    }
+
     /// Helper to get the node and port from an edge ID.
-    fn node_port_from_id(mut id: u64) -> (NodeId, Uint) {
+    fn node_port_from_id(mut id: u64) -> Option<(NodeId, Uint)> {
         let port = id.get_bits(62..64);
         id.set_bits(62..64, 0);
-        (id, port)
-    }
-}
-
-// /// A mutation that may be made to an edge in [`Edges`].
-// #[derive(Debug, Clone, Copy)]
-// pub enum EdgeMutation {
-//     /// Connect node `a`'s `a_port` to whatever node `b`s `b_port` was connected to.
-//     Reconnect(Edge),
-//     /// Connect whatever was connected to `a`s `a_port` to whatever was connected to `b`s `b_port`.
-//     ///
-//     /// This is similar to [`Reconnect`], but subtly different, because it doesn't connect a to b,
-//     /// it connects _whatever is connect to a_, to b.
-//     Bridge(Edge),
-//     /// Insert a new edge.
-//     InsertEdge(Edge),
-//     /// Remove an existing edge.
-//     RemoveEdge(Edge),
-// }
-
-/// A mutation that may be applied to [`Edges`].
-pub struct EdgeMutation(Box<dyn FnMut(&mut Edges) + Sync + Send>);
-
-pub struct PendingAllocations {
-    /// The number of new nodes to allocate.
-    count: usize,
-    /// The mutation to be applied to edges when the allocation is finished.
-    mutation: Box<dyn FnMut(&mut Edges, &[NodeId]) + Sync + Send + 'static>,
-}
-
-impl PendingAllocations {
-    pub fn new<F: FnMut(&mut Edges, &[NodeId]) + Sync + Send + 'static>(
-        count: usize,
-        f: F,
-    ) -> Self {
-        Self {
-            count,
-            mutation: Box::new(f),
+        if port == 0 {
+            None
+        } else {
+            Some((id, port - 1))
         }
-    }
-}
-
-impl EdgeMutation {
-    /// Create a new edge mutation for a closure that mutates [`Edges`].
-    pub fn new<F: FnMut(&mut Edges) + Sync + Send + 'static>(f: F) -> Self {
-        Self(Box::new(f))
     }
 }
 
@@ -347,36 +209,38 @@ impl From<(NodeId, Uint, NodeId, Uint)> for Edge {
 }
 
 /// Iterator over the pairs of connected nodes in an [`Edges`] store.
-pub struct EdgeIter<'a> {
-    iter: std::collections::hash_map::Iter<'a, u64, u64>,
+pub struct EdgeIter {
+    mmap: MutexGuardArc<MmapMut>,
+    edge_idx: usize,
 }
 
-impl<'a> EdgeIter<'a> {
-    fn new(iter: std::collections::hash_map::Iter<'a, u64, u64>) -> Self {
-        Self { iter }
+impl EdgeIter {
+    fn new(mmap: MutexGuardArc<MmapMut>) -> Self {
+        Self { mmap, edge_idx: 0 }
     }
 }
 
-impl<'a> Iterator for EdgeIter<'a> {
+impl Iterator for EdgeIter {
     type Item = Edge;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            let (a, b) = self.iter.next()?;
-            let (a, a_port) = Edges::node_port_from_id(*a);
-            let (b, b_port) = Edges::node_port_from_id(*b);
-
-            // Since the map contains two entries for each edge, we make sure we return each edge
-            // once by only returning edges where `a` is less than `b` or where `a_port` is less
-            // than `b_port` when the node is connected to itself.
-            if a > b || (a == b && a_port > b_port) {
-                continue;
+            if self.edge_idx * EDGE_SIZE >= self.mmap.len() {
+                break None;
             }
+            let idx = self.edge_idx;
+            self.edge_idx += 1;
+            let u64s: &[u64] = bytemuck::cast_slice(&self.mmap[..]);
 
-            return Some(Edge {
+            let id1 = u64s[idx * U64S_PER_EDGE];
+            let id2 = u64s[idx * U64S_PER_EDGE + 1];
+
+            let Some((a, a_port)) = Edges::node_port_from_id(id1) else {continue;};
+            let (b, b_port) = Edges::node_port_from_id(id2).expect("Found only edge data");
+            break Some(Edge {
                 a,
-                b,
                 a_port,
+                b,
                 b_port,
             });
         }
@@ -384,9 +248,9 @@ impl<'a> Iterator for EdgeIter<'a> {
 }
 
 /// Iterator over the active pairs in an [`Edges`] store.
-pub struct ActivePairIter<'a>(EdgeIter<'a>);
+pub struct ActivePairIter(EdgeIter);
 
-impl<'a> Iterator for ActivePairIter<'a> {
+impl Iterator for ActivePairIter {
     type Item = (NodeId, NodeId);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -405,12 +269,12 @@ mod test {
     #[test]
     /// Test [`Edges`] insertion and iteration.
     fn insert_and_iter() {
-        let mut edges = Edges::new(6);
+        let mut edges = Edges::new(1024);
 
         // Create some nodes ( use random numbers since the nodes won't always be in order in real
         // operation )
         //                                                      a  b   c   d   e  f
-        let (a, b, c, d, e, f) = (0, 20, 53, 13, 2, 33);
+        let (a, b, c, d, e, f) = (0, 13, 53, 20, 2, 33);
 
         // Connect them in the form of the interaction net for `(λx.xx)(λx.x)`
         let edges_to_create = [
@@ -425,14 +289,12 @@ mod test {
         ];
 
         // Insert edges from list
-        for (a, ap, b, bp) in edges_to_create {
-            edges.insert(Edge {
-                a,
-                b,
-                a_port: ap,
-                b_port: bp,
-            });
-        }
+        edges.allocate(edges_to_create.iter().copied().map(|(a, ap, b, bp)| Edge {
+            a,
+            b,
+            a_port: ap,
+            b_port: bp,
+        }));
 
         // Make sure the iterator returns the proper number of pairs
         let pairs = edges.iter();
@@ -459,7 +321,7 @@ mod test {
 
         // Make sure the active pair iterator returns our only active pair
         let active_pairs = edges.active_pairs().collect::<Vec<_>>();
-        assert_eq!(active_pairs, vec![(d, b)]);
+        assert_eq!(active_pairs, vec![(b, d)]);
     }
 
     // /// Test that we can apply multiple annihilations on a couple nodes that are connected to

@@ -100,7 +100,7 @@ pub fn ui_tab(ui: &mut egui::Ui, state: &mut State) {
                 ui.set_enabled(ast.is_ok());
                 if ui.button("Make Graph").clicked() {
                     if let Ok(ast) = ast {
-                        let mem_size = 20;
+                        let mem_size = 400;
                         let mut runtime = Runtime::new(mem_size, 4);
                         runtime.graph = ast.into_graph(mem_size);
                         state.graph_display_simulation = Default::default();
@@ -210,9 +210,9 @@ pub fn ui_tab(ui: &mut egui::Ui, state: &mut State) {
                             "{}{}",
                             match node_kind {
                                 NodeKind::Null => "N",
-                                NodeKind::Constructor => "γ",
-                                NodeKind::Duplicator => "δ",
-                                NodeKind::Eraser => "ε",
+                                NodeKind::Constructor => "C",
+                                NodeKind::Duplicator => "D",
+                                NodeKind::Eraser => "E",
                                 NodeKind::Root => "R",
                             },
                             node_id
@@ -319,14 +319,14 @@ impl GraphAst {
             .collect::<HashMap<_, _>>();
 
         // Create the edges
-        for ((a, ap), (b, bp)) in self.edges {
-            graph.edges.insert(Edge {
+        graph
+            .edges
+            .allocate(self.edges.into_iter().map(|((a, ap), (b, bp))| Edge {
                 a: *node_names.get(&a).unwrap(),
                 b: *node_names.get(&b).unwrap(),
                 a_port: ap as _,
                 b_port: bp as _,
-            });
-        }
+            }));
 
         graph
     }
@@ -336,16 +336,11 @@ impl SimulationState {
     // Note: This code could probably be better de-duplicated between the node and edge looping sections.
     pub fn update(&mut self, graph: &Graph, radius: f32, dt: f32) {
         const COOLOFF: f32 = 0.98;
-        const SCALE: f32 = 30.0;
+        const SCALE: f32 = 40.0;
 
-        // TODO: avoid cloning the entire node vec like this
-        let nodes = graph
-            .nodes
-            .iter()
-            .enumerate()
-            .filter(|x| x.1 != NodeKind::Null)
-            .map(|x| x.0 as NodeId)
-            .collect::<Vec<_>>();
+        // TODO: avoid cloning the entire nodes/edges vec like this
+        let nodes = graph.nodes.iter_non_null().map(|x| x.0).collect::<Vec<_>>();
+        let edges = graph.edges.iter().collect::<Vec<_>>();
 
         let mut rng = rand::thread_rng();
         for node in nodes.iter().copied() {
@@ -394,7 +389,21 @@ impl SimulationState {
                 let mut f = egui::Vec2::ZERO;
 
                 for port in 0..3 {
-                    let Some((other_node, other_port)) = graph.edges.get(node_id, port) else {continue;};
+                    let search = graph
+                        .edges
+                        .iter()
+                        .find(|e| {
+                            (e.a == node_id && e.a_port == port)
+                                || (e.b == node_id && e.b_port == port)
+                        })
+                        .map(|e| {
+                            if e.a == node_id {
+                                (e.b, e.b_port)
+                            } else {
+                                (e.a, e.a_port)
+                            }
+                        });
+                    let Some((other_node, other_port)) = search else {continue;};
 
                     let edge_pos = old_state
                         .edge_positions
@@ -422,7 +431,7 @@ impl SimulationState {
             self.node_positions.insert(node_id, pos + *vel * dt);
         }
 
-        for edge in graph.edges.iter() {
+        for edge in edges.iter().copied() {
             let mut force = egui::Vec2::ZERO;
             let pos = old_state.edge_positions.get(&edge).copied().unwrap();
 
@@ -430,7 +439,7 @@ impl SimulationState {
             force += {
                 let mut f = egui::Vec2::ZERO;
 
-                for other_edge in graph.edges.iter() {
+                for other_edge in edges.iter().copied() {
                     if edge == other_edge {
                         continue;
                     };

@@ -49,33 +49,29 @@ impl std::fmt::Debug for Graph {
         } else {
             writeln!(f, "Nodes:")?;
 
-            let mmap = self.nodes.lock();
-            let mut node_bytes = mmap.iter().enumerate();
+            let mut nodes = self.nodes.iter_non_null();
 
             'nodes: loop {
-                for _ in 0..2 {
-                    let Some((byte_idx, node_byte)) = node_bytes.next() else { break 'nodes; };
-                    for j in 0..NODES_PER_BYTE {
-                        let bit_start = j * BITS_PER_NODE;
-                        let bits = bit_start..(bit_start + BITS_PER_NODE);
-                        let node_kind = node_byte.get_bits(bits);
-                        write!(
-                            f,
-                            "{:<3}: {:<8}",
-                            byte_idx * NODES_PER_BYTE + j,
-                            match NodeKind::from(node_kind) {
-                                NodeKind::Null => "N",
-                                NodeKind::Constructor => "C",
-                                NodeKind::Duplicator => "D",
-                                NodeKind::Eraser => "E",
-                                NodeKind::Root => "R",
-                            }
-                        )?;
-                    }
+                write!(f, "    ")?;
+                for _ in 0..16 {
+                    let Some((node_id, node_kind)) = nodes.next() else { break 'nodes; };
+                    write!(
+                        f,
+                        "{:<3}: {:<8}",
+                        node_id,
+                        match node_kind {
+                            NodeKind::Null => "N",
+                            NodeKind::Constructor => "C",
+                            NodeKind::Duplicator => "D",
+                            NodeKind::Eraser => "E",
+                            NodeKind::Root => "R",
+                        }
+                    )?;
                 }
 
                 writeln!(f)?;
             }
+            writeln!(f)?;
 
             writeln!(f, "Edges:")?;
             let mut edges = self.edges.iter();
@@ -247,8 +243,8 @@ impl Runtime {
                 let (pending_allocation_sender, pending_allocation_receiver) =
                     channel::<PendingAllocation>();
 
-                // Create channel for sending edge mutations
-                let (edge_mutation_sender, edge_mutation_receiver) = channel::<EdgeMutation>();
+                // // Create channel for sending edge mutations
+                // let (edge_mutation_sender, edge_mutation_receiver) = channel::<EdgeMutation>();
 
                 // Iterate over the chunks of nodes in parallel, applying the second pass, to apply
                 // annihilations, duplications, and erases.
@@ -303,57 +299,57 @@ impl Runtime {
 
                                             // The lower node is responsible for modifying the edges
                                             if node < other_node {
-                                                edge_mutation_sender
-                                                    .send(EdgeMutation::new(move |edges| {
-                                                        // Disconnect the active pair
-                                                        edges.remove(Edge {
-                                                            a: node,
-                                                            a_port: 0,
-                                                            b: other_node,
-                                                            b_port: 0,
-                                                        });
+                                                // edge_mutation_sender
+                                                //     .send(EdgeMutation::new(move |edges| {
+                                                //         // Disconnect the active pair
+                                                //         edges.remove(Edge {
+                                                //             a: node,
+                                                //             a_port: 0,
+                                                //             b: other_node,
+                                                //             b_port: 0,
+                                                //         });
 
-                                                        // Bridge the nodes
-                                                        for (a, a_port, b, b_port) in [
-                                                            (node, 1, other_node, 1),
-                                                            (node, 2, other_node, 2),
-                                                        ] {
-                                                            // Find out what node b is connected to.
-                                                            let (b2, b2_port) = edges
-                                                                .get(b, b_port)
-                                                                .expect("missing edge");
+                                                //         // Bridge the nodes
+                                                //         for (a, a_port, b, b_port) in [
+                                                //             (node, 1, other_node, 1),
+                                                //             (node, 2, other_node, 2),
+                                                //         ] {
+                                                //             // Find out what node b is connected to.
+                                                //             let (b2, b2_port) = edges
+                                                //                 .get(b, b_port)
+                                                //                 .expect("missing edge");
 
-                                                            // Remove the connection between `b` and `b2`
-                                                            edges.remove(Edge {
-                                                                a: b2,
-                                                                b,
-                                                                a_port: b2_port,
-                                                                b_port,
-                                                            });
+                                                //             // Remove the connection between `b` and `b2`
+                                                //             edges.remove(Edge {
+                                                //                 a: b2,
+                                                //                 b,
+                                                //                 a_port: b2_port,
+                                                //                 b_port,
+                                                //             });
 
-                                                            // Find out what node a is connected to.
-                                                            let (a2, a2_port) = edges
-                                                                .get(a, a_port)
-                                                                .expect("missing edge");
+                                                //             // Find out what node a is connected to.
+                                                //             let (a2, a2_port) = edges
+                                                //                 .get(a, a_port)
+                                                //                 .expect("missing edge");
 
-                                                            // Remove the connection between `a` and `a2`
-                                                            edges.remove(Edge {
-                                                                a,
-                                                                b: a2,
-                                                                a_port,
-                                                                b_port: a2_port,
-                                                            });
+                                                //             // Remove the connection between `a` and `a2`
+                                                //             edges.remove(Edge {
+                                                //                 a,
+                                                //                 b: a2,
+                                                //                 a_port,
+                                                //                 b_port: a2_port,
+                                                //             });
 
-                                                            // Connect `a2` to `b2`
-                                                            edges.insert(Edge {
-                                                                a: a2,
-                                                                b: b2,
-                                                                a_port: a2_port,
-                                                                b_port: b2_port,
-                                                            });
-                                                        }
-                                                    }))
-                                                    .unwrap();
+                                                //             // Connect `a2` to `b2`
+                                                //             edges.insert(Edge {
+                                                //                 a: a2,
+                                                //                 b: b2,
+                                                //                 a_port: a2_port,
+                                                //                 b_port: b2_port,
+                                                //             });
+                                                //         }
+                                                //     }))
+                                                //     .unwrap();
                                             }
                                         }
 
@@ -458,37 +454,37 @@ impl Runtime {
                                             nodes[node_byte_idx]
                                                 .set_bits(bits, NodeKind::Eraser as u8);
 
-                                            edge_mutation_sender
-                                                .send(EdgeMutation::new(move |edges| {
-                                                    let (c, c_port) = edges.get(node, 1).unwrap();
-                                                    edges.remove(Edge {
-                                                        a: node,
-                                                        a_port: 1,
-                                                        b: c,
-                                                        b_port: c_port,
-                                                    });
-                                                    edges.insert(Edge {
-                                                        a: other_node,
-                                                        a_port: 0,
-                                                        b: c,
-                                                        b_port: c_port,
-                                                    });
+                                            // edge_mutation_sender
+                                            //     .send(EdgeMutation::new(move |edges| {
+                                            //         let (c, c_port) = edges.get(node, 1).unwrap();
+                                            //         edges.remove(Edge {
+                                            //             a: node,
+                                            //             a_port: 1,
+                                            //             b: c,
+                                            //             b_port: c_port,
+                                            //         });
+                                            //         edges.insert(Edge {
+                                            //             a: other_node,
+                                            //             a_port: 0,
+                                            //             b: c,
+                                            //             b_port: c_port,
+                                            //         });
 
-                                                    let (d, d_port) = edges.get(node, 2).unwrap();
-                                                    edges.remove(Edge {
-                                                        a: node,
-                                                        a_port: 2,
-                                                        b: d,
-                                                        b_port: d_port,
-                                                    });
-                                                    edges.insert(Edge {
-                                                        a: node,
-                                                        a_port: 0,
-                                                        b: d,
-                                                        b_port: d_port,
-                                                    });
-                                                }))
-                                                .unwrap();
+                                            //         let (d, d_port) = edges.get(node, 2).unwrap();
+                                            //         edges.remove(Edge {
+                                            //             a: node,
+                                            //             a_port: 2,
+                                            //             b: d,
+                                            //             b_port: d_port,
+                                            //         });
+                                            //         edges.insert(Edge {
+                                            //             a: node,
+                                            //             a_port: 0,
+                                            //             b: d,
+                                            //             b_port: d_port,
+                                            //         });
+                                            //     }))
+                                            //     .unwrap();
                                         }
                                         (
                                             NodeKind::Eraser,
@@ -525,16 +521,16 @@ impl Runtime {
 
                                             // The lower node is in charge of deleting the edge
                                             if node < other_node {
-                                                edge_mutation_sender
-                                                    .send(EdgeMutation::new(move |edges| {
-                                                        edges.remove(Edge {
-                                                            a: node,
-                                                            b: other_node,
-                                                            a_port: 0,
-                                                            b_port: 0,
-                                                        });
-                                                    }))
-                                                    .unwrap();
+                                                // edge_mutation_sender
+                                                //     .send(EdgeMutation::new(move |edges| {
+                                                //         edges.remove(Edge {
+                                                //             a: node,
+                                                //             b: other_node,
+                                                //             a_port: 0,
+                                                //             b_port: 0,
+                                                //         });
+                                                //     }))
+                                                //     .unwrap();
                                             }
                                         }
 
@@ -574,7 +570,7 @@ impl Runtime {
                             chunk_node_idx_start,
                             pending_allocation_receiver.try_iter(),
                             &pending_allocation_sender,
-                            &edge_mutation_sender,
+                            // &edge_mutation_sender,
                         )
                     });
 
@@ -586,7 +582,7 @@ impl Runtime {
                     0,
                     pending_allocation_receiver.try_iter(),
                     &pending_allocation_sender,
-                    &edge_mutation_sender,
+                    // &edge_mutation_sender,
                 );
 
                 // If we still have pending allocations
@@ -596,12 +592,12 @@ impl Runtime {
                     todo!("Expand node memory: ran out of room.");
                 }
 
-                // Apply all edge mutations
-                // TODO(perf): do this in parallel while the other threads are processing chunks if
-                // posible.
-                self.graph
-                    .edges
-                    .apply_mutations(edge_mutation_receiver.try_iter());
+                // // Apply all edge mutations
+                // // TODO(perf): do this in parallel while the other threads are processing chunks if
+                // // posible.
+                // self.graph
+                //     .edges
+                //     .apply_mutations(edge_mutation_receiver.try_iter());
             });
         }
 
@@ -617,7 +613,7 @@ impl Runtime {
 /// Helper struct for allocations that need to be deferred.
 struct PendingAllocation {
     kind: NodeKind,
-    edge_mutations: [Option<EdgeMutation>; 3],
+    // edge_mutations: [Option<EdgeMutation>; 3],
 }
 
 /// Helper to attempt to allocate any pending allocations into the given iterator of nodes.
@@ -626,7 +622,7 @@ fn handle_pending_allocations<'a, N, A>(
     node_start_idx: usize,
     pending_allocations: A,
     pending_allocation_sender: &Sender<PendingAllocation>,
-    edge_mutation_sender: &Sender<EdgeMutation>,
+    // edge_mutation_sender: &Sender<EdgeMutation>,
 ) where
     N: IntoIterator<Item = &'a mut u8>,
     A: IntoIterator<Item = PendingAllocation>,
@@ -695,49 +691,49 @@ impl Default for Runtime {
 mod test {
     use super::*;
 
-    #[test]
-    fn reduce_x_dot_xx_app_x_dot_x() {
-        let mut runtime = Runtime::new_thread_per_core(10);
+    // #[test]
+    // fn reduce_x_dot_xx_app_x_dot_x() {
+    //     let mut runtime = Runtime::new_thread_per_core(10);
 
-        // Create some nodes
-        let nodes = runtime.graph.nodes.allocate([
-            NodeKind::Constructor,
-            NodeKind::Constructor,
-            NodeKind::Constructor,
-            NodeKind::Duplicator,
-            NodeKind::Constructor,
-            NodeKind::Root,
-        ]);
-        let [a, b, c, d, e, f] = std::array::from_fn(|i| nodes[i]);
+    //     // Create some nodes
+    //     let nodes = runtime.graph.nodes.allocate([
+    //         NodeKind::Constructor,
+    //         NodeKind::Constructor,
+    //         NodeKind::Constructor,
+    //         NodeKind::Duplicator,
+    //         NodeKind::Constructor,
+    //         NodeKind::Root,
+    //     ]);
+    //     let [a, b, c, d, e, f] = std::array::from_fn(|i| nodes[i]);
 
-        // Connect them in the form of the interaction net for `(λx.xx)(λx.x)`
-        [
-            (a, 1, a, 2),
-            (a, 0, b, 1),
-            (b, 0, c, 0),
-            (c, 1, d, 0),
-            (c, 2, e, 2),
-            (d, 1, e, 1),
-            (e, 0, d, 2),
-            (b, 2, f, 0),
-        ]
-        .into_iter()
-        .for_each(|(a, ap, b, bp)| {
-            runtime.graph.edges.insert(Edge {
-                a,
-                b,
-                a_port: ap,
-                b_port: bp,
-            });
-        });
+    //     // Connect them in the form of the interaction net for `(λx.xx)(λx.x)`
+    //     [
+    //         (a, 1, a, 2),
+    //         (a, 0, b, 1),
+    //         (b, 0, c, 0),
+    //         (c, 1, d, 0),
+    //         (c, 2, e, 2),
+    //         (d, 1, e, 1),
+    //         (e, 0, d, 2),
+    //         (b, 2, f, 0),
+    //     ]
+    //     .into_iter()
+    //     .for_each(|(a, ap, b, bp)| {
+    //         // runtime.graph.edges.insert(Edge {
+    //         //     a,
+    //         //     b,
+    //         //     a_port: ap,
+    //         //     b_port: bp,
+    //         // });
+    //     });
 
-        println!("{:#?}\n\n", runtime.graph);
+    //     println!("{:#?}\n\n", runtime.graph);
 
-        // Reduce the graph
-        while runtime.reduce_steps(1) {
-            println!("{:#?}\n\n", runtime.graph);
-        }
+    //     // Reduce the graph
+    //     while runtime.reduce_steps(1) {
+    //         println!("{:#?}\n\n", runtime.graph);
+    //     }
 
-        panic!();
-    }
+    //     panic!();
+    // }
 }

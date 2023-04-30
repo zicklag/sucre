@@ -114,6 +114,36 @@ impl Nodes {
             node_idx: 0,
         }
     }
+
+    /// Get an iterator over the non-null nodes, and their IDs.
+    pub fn iter_non_null(&self) -> NonNullIter {
+        NonNullIter {
+            iter: self.iter(),
+            id: 0,
+        }
+    }
+}
+
+/// An iterator over non-null [`Nodes`].
+pub struct NonNullIter {
+    iter: NodeIter,
+    id: usize,
+}
+
+impl Iterator for NonNullIter {
+    type Item = (NodeId, NodeKind);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let r = self
+            .iter
+            .by_ref()
+            .filter(|x| *x != NodeKind::Null)
+            .map(|kind| (self.id as NodeId, kind))
+            .next();
+        self.id += 1;
+
+        r
+    }
 }
 
 /// An iterater over [`Nodes`].
