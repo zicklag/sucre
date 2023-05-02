@@ -200,6 +200,7 @@ pub fn ui_tab(ui: &mut egui::Ui, state: &mut State) {
                             NodeKind::Duplicator => egui::Color32::DARK_BLUE,
                             NodeKind::Eraser => egui::Color32::DARK_RED,
                             NodeKind::Root => egui::Color32::from_rgb(150, 50, 50),
+                            NodeKind::Passthrough => egui::Color32::LIGHT_GRAY,
                         },
                         (0.0, egui::Color32::TRANSPARENT),
                     ));
@@ -214,6 +215,7 @@ pub fn ui_tab(ui: &mut egui::Ui, state: &mut State) {
                                 NodeKind::Duplicator => "D",
                                 NodeKind::Eraser => "E",
                                 NodeKind::Root => "R",
+                                NodeKind::Passthrough => "P",
                             },
                             node_id
                         ),
@@ -264,7 +266,7 @@ peg::parser! {
     rule _ = (" " / "\t")*
     rule __ = (" " / "\t" / "\n")*
 
-    rule name() = ['a'..='z' | 'A'..='Z']
+    rule name() = ['a'..='z' | 'A'..='Z']+
     rule port_number() -> u8 =
         "0" { 0 } / "1" { 1 } / "2" { 2 }
     rule node_kind() -> NodeKind =

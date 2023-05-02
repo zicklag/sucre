@@ -1,6 +1,6 @@
 //! Contains the [`Edges`] container and iterators.
 
-use crossbeam_channel::bounded;
+use crossbeam_channel::{bounded, Receiver};
 use memmap2::MmapMut;
 use rayon::{
     prelude::ParallelIterator,
@@ -20,6 +20,8 @@ pub const U64S_PER_EDGE: usize = 2;
 /// Compressed adjacency matrix for storing node connections.
 pub struct Edges {
     mmap: MmapMut,
+    /// Buffer re-used in calls to [`Self::apply_mutations()`].
+    pending_mutations: Vec<EdgeMutation>,
 }
 
 impl Clone for Edges {
@@ -27,7 +29,10 @@ impl Clone for Edges {
         let mut mmap = MmapMut::map_anon(self.mmap.len()).unwrap();
         mmap.advise(memmap2::Advice::Sequential).ok();
         mmap.copy_from_slice(&self.mmap);
-        Self { mmap }
+        Self {
+            mmap,
+            pending_mutations: Vec::new(),
+        }
     }
 }
 
@@ -41,7 +46,10 @@ impl Edges {
         );
         let mmap = MmapMut::map_anon(memory_size + (memory_size % EDGE_SIZE)).unwrap();
         mmap.advise(memmap2::Advice::Sequential).ok();
-        Self { mmap }
+        Self {
+            mmap,
+            pending_mutations: Vec::new(),
+        }
     }
 
     /// Allocate the edges in the given iterator in parallel.
@@ -138,6 +146,115 @@ impl Edges {
             .filter(|e| e.a_port == 0 && e.b_port == 0)
             .map(|e| (e.a, e.b))
     }
+
+    /// Apply edge mutations.
+    pub fn apply_mutations<I: IntoIterator<Item = EdgeMutation>>(&mut self, mutations: I) {
+        let Self {
+            mmap,
+            pending_mutations,
+        } = self;
+        let u64s: &mut [u64] = bytemuck::cast_slice_mut(&mut mmap[..]);
+
+        // Collect the pending mutations into our buffer
+        let mutations = mutations.into_iter();
+        pending_mutations.clear();
+        pending_mutations.extend(mutations);
+
+        u64s.par_chunks_mut(CHUNK_SIZE * U64S_PER_EDGE)
+            .for_each(|chunk| {
+                'mutations: for mutation in &self.pending_mutations {
+                    match mutation {
+                        EdgeMutation::Annihilate { a, b } => {
+                            let active_edge = Edge {
+                                a: *a,
+                                b: *b,
+                                a_port: 0,
+                                b_port: 0,
+                            }
+                            .canonical();
+
+                            for ids in chunk.chunks_exact_mut(U64S_PER_EDGE) {
+                                let Some(edge) = Self::edge_for_ids(ids) else { continue; };
+
+                                // Delete the active edge
+                                if edge.canonical() == active_edge {
+                                    ids[0] = 0;
+                                    ids[1] = 0;
+                                    continue;
+                                }
+
+                                for id in ids {
+                                    let (node, port) = Self::node_port_from_id(*id).unwrap();
+
+                                    if node == *a && port == 1 {
+                                        *id = Self::id_from_node_port(*b, 2);
+                                    } else if node == *b && port == 2 {
+                                        // Connect it to the eraser's port 0
+                                        *id = Self::id_from_node_port(*a, 1)
+                                    }
+                                }
+                            }
+                        }
+                        EdgeMutation::EraseEdge(edge_to_delete) => {
+                            let edge_to_delete = edge_to_delete.canonical();
+                            // For all of the edges in the chunk
+                            for ids in chunk.chunks_exact_mut(U64S_PER_EDGE) {
+                                let Some(edge) = Self::edge_for_ids(ids) else { continue; };
+
+                                // If this edge matches the one to delete
+                                if edge.canonical() == edge_to_delete {
+                                    // Delete it
+                                    ids[0] = 0;
+                                    ids[1] = 0;
+                                    continue 'mutations;
+                                }
+                            }
+                        }
+                        EdgeMutation::EraseConstructor {
+                            constructor,
+                            eraser,
+                        } => {
+                            let active_edge = Edge {
+                                a: *constructor,
+                                b: *eraser,
+                                a_port: 0,
+                                b_port: 0,
+                            }
+                            .canonical();
+
+                            // For all of the edges in the chunk
+                            for ids in chunk.chunks_exact_mut(U64S_PER_EDGE) {
+                                let Some(edge) = Self::edge_for_ids(ids) else { continue; };
+
+                                // If this is the active edge
+                                if edge.canonical() == active_edge {
+                                    // Delete it
+                                    ids[0] = 0;
+                                    ids[1] = 0;
+                                    continue;
+                                }
+
+                                for id in ids {
+                                    let (node, port) = Self::node_port_from_id(*id).unwrap();
+
+                                    // If this is constructor port 1
+                                    if node == *constructor && port == 1 {
+                                        // Connect it to constructor port 0 ( which constructor will
+                                        // actually be turned into an eraser by now )
+                                        *id = Self::id_from_node_port(*constructor, 0);
+
+                                    // If this is the constructor port 2
+                                    } else if node == *constructor && port == 2 {
+                                        // Connect it to the eraser's port 0
+                                        *id = Self::id_from_node_port(*eraser, 0)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+    }
 }
 
 /// Internal helper functions
@@ -200,6 +317,13 @@ impl Edges {
             Some((id, port - 1))
         }
     }
+}
+
+/// Queued mutation that will be applied to [`Edges`].
+pub enum EdgeMutation {
+    EraseEdge(Edge),
+    EraseConstructor { constructor: NodeId, eraser: NodeId },
+    Annihilate { a: NodeId, b: NodeId },
 }
 
 // TODO(perf): We know that the `a_port` and `b_port` are going to be between 1 and 3, so should we

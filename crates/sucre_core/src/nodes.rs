@@ -169,6 +169,9 @@ pub enum NodeKind {
     Eraser = 3,
     /// The node is a root node that represents the result of the computation.
     Root = 4,
+    /// A node that that passes through connects on it's port 2 to it's port 1. These are temporary
+    /// and will be deleted when possible.
+    Passthrough = 5,
 }
 
 impl From<u8> for NodeKind {
@@ -181,6 +184,7 @@ impl From<u8> for NodeKind {
             2 => Duplicator,
             3 => Eraser,
             4 => Root,
+            5 => Passthrough,
             _ => panic!("Invalid node type"),
         }
     }
